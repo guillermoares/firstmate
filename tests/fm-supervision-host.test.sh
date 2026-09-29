@@ -147,17 +147,28 @@ unset FM_SUPERVISION_ACTOR FM_BRANCH_REPORT_TURN FM_LEASE_HOLDER_PID PI_CODING_A
 HOMES_FILE="$TMP_ROOT/homes"
 # Stop whatever a case left running, by the exact pids its home recorded.
 stop_home_processes() {  # <home>
-  local home=$1 pid
+  local home=$1 pid arms=
   if [ -f "$home/state/.supervision-host" ]; then
+    arms=$(awk -F '\t' '$1 == "arm" { print $2 }' "$home/state/.supervision-host")
     pid=$(awk -F '\t' '$1 == "host" { print $2; exit }' "$home/state/.supervision-host")
     [ -z "$pid" ] || kill -TERM "$pid" 2>/dev/null || true
     sleep 1
   fi
-  pid=$(cat "$home/state/.watch.lock/pid" 2>/dev/null || true)
-  [ -z "$pid" ] || kill -TERM "$pid" 2>/dev/null || true
-  for pid in $(cat "$home/claude-pids" 2>/dev/null) $(cat "$home/orphan-pid" 2>/dev/null); do
+  for pid in $arms; do
     kill -TERM "$pid" 2>/dev/null || true
   done
+  pid=$(cat "$home/state/.watch.lock/pid" 2>/dev/null || true)
+  [ -z "$pid" ] || kill -TERM "$pid" 2>/dev/null || true
+  while IFS= read -r pid; do
+    if [ -e "$home/session.stop" ]; then
+      wait "$pid" 2>/dev/null || true
+    else
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+  done < <(cat "$home/claude-pids" 2>/dev/null)
+  while IFS= read -r pid; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done < <(cat "$home/orphan-pid" 2>/dev/null)
 }
 suite_cleanup() {
   local home
@@ -990,6 +1001,7 @@ test_off_written_while_parked_passes_the_next_attended_close_to_main() {
   [ "$(engine_calls "$home")" -eq 0 ] || fail "off while parked: the engine ran after the home opted out"
   assert_re '	pass-through	attended	the home does not run the supervision host	signal:' "$home/state/.supervision-host.log" \
     "the ledger must name the opt-out as why the close went to main"
+  stop_home_processes "$home"
   pass "host: an off written while the host is parked sends the next attended close to main, naming the opt-out"
 }
 
@@ -1223,6 +1235,8 @@ test_claude_stop_hook_runs_the_host_without_the_file_and_off_opts_out() {
   assert_re '	handled	turn=[^	]*	posture=attended	' "$home/state/.supervision-host.log" "the ledger must record the attended turn"
   [ ! -s "$home/hook.rc" ] || fail "a routine attended wake on a Claude home without the file reached main: $(cat "$home/hook.err")"
   watcher_live "$home" || fail "default-on: the host is not parked on a live successor"
+  : > "$home/session.stop"
+  stop_home_processes "$home"
 
   home=$(make_primary_home hook-opted-out)
   printf 'off\n' > "$home/config/supervision-host"
@@ -1237,6 +1251,8 @@ test_claude_stop_hook_runs_the_host_without_the_file_and_off_opts_out() {
   assert_absent "$home/state/.supervision-host.log" "a home whose file says off must never run the host"
   assert_absent "$home/state/.host-mirror.jsonl" "a home whose file says off must mirror nothing"
   [ "$(engine_calls "$home")" -eq 0 ] || fail "a home whose file says off ran an engine turn"
+  : > "$home/session.stop"
+  stop_home_processes "$home"
   pass "host+hook: a Claude home without config/supervision-host runs the host at the default engine, and an off file restores the plain arm"
 }
 
