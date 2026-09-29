@@ -412,30 +412,42 @@ test_dispatch_entry_scopes_rows_and_renders_the_away_tail() {
 # --- host loop ----------------------------------------------------------------
 
 
-# BRANCH OUTCOMES belongs to an opted-in home off Pi: without the file the drain
-# and the store's markers are exactly as before, and on Pi the branch extension
-# owns the same outcomes.
-test_branch_outcomes_only_on_an_opted_in_home_off_pi() {
-  local home drained fakepi
+# BRANCH OUTCOMES belongs to a home that runs the host off Pi: on a Claude
+# primary that is the default and an `off` file opts out, while another
+# primary still needs the file; wherever the home does not run the host the
+# drain and the store's markers are exactly as before, and on Pi the branch
+# extension owns the same outcomes.
+test_branch_outcomes_only_on_a_host_home_off_pi() {
+  local home drained fakes
   home="$TMP_ROOT/drain-scope"
   mkdir -p "$home/state" "$home/config"
   FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" append --task demo --verdict captain --summary 'PR ready for review' >/dev/null \
     || fail "fixture: could not record a captain outcome"
-  drained=$(FM_HOME="$home" "$FAKE_CLAUDE" -c '"$0" 2>&1' "$ROOT/bin/fm-wake-drain.sh")
-  assert_not_contains "$drained" "BRANCH OUTCOMES" "a home without config/supervision-host must not present branch outcomes"
-  assert_absent "$home/state/.branch-outcomes-cursor" "a home without config/supervision-host must keep the store's read cursor untouched"
+  fakes="$TMP_ROOT/drain-scope-fakes"
+  mkdir -p "$fakes"
+  ln -sf /bin/bash "$fakes/pi"
+  ln -sf /bin/bash "$fakes/codex"
 
-  : > "$home/config/supervision-host"
-  fakepi="$TMP_ROOT/fakepi"
-  mkdir -p "$fakepi"
-  ln -sf /bin/bash "$fakepi/pi"
-  drained=$(FM_HOME="$home" "$fakepi/pi" -c '"$0" 2>&1' "$ROOT/bin/fm-wake-drain.sh")
+  printf 'off\n' > "$home/config/supervision-host"
+  drained=$(FM_HOME="$home" "$FAKE_CLAUDE" -c '"$0" 2>&1' "$ROOT/bin/fm-wake-drain.sh")
+  assert_not_contains "$drained" "BRANCH OUTCOMES" "a Claude home whose file says off must not present branch outcomes"
+  assert_absent "$home/state/.branch-outcomes-cursor" "a Claude home whose file says off must keep the store's read cursor untouched"
+
+  rm -f "$home/config/supervision-host"
+  drained=$(FM_HOME="$home" "$fakes/codex" -c '"$0" 2>&1' "$ROOT/bin/fm-wake-drain.sh")
+  assert_not_contains "$drained" "BRANCH OUTCOMES" "a Codex home without config/supervision-host must not present branch outcomes"
+  assert_absent "$home/state/.branch-outcomes-cursor" "a Codex home without config/supervision-host must keep the store's read cursor untouched"
+  drained=$(FM_HOME="$home" "$fakes/pi" -c '"$0" 2>&1' "$ROOT/bin/fm-wake-drain.sh")
   assert_not_contains "$drained" "BRANCH OUTCOMES" "a Pi primary's drain must leave captain outcomes to the branch extension"
   assert_absent "$home/state/.branch-outcomes-cursor" "a Pi primary's drain must not advance the store's read cursor"
 
   drained=$(FM_HOME="$home" "$FAKE_CLAUDE" -c '"$0" 2>&1' "$ROOT/bin/fm-wake-drain.sh")
-  assert_contains "$drained" "[seq 1, recorded 0m ago] demo: PR ready for review" "an opted-in home off Pi must present the captain outcome"
-  pass "drain: BRANCH OUTCOMES runs only on an opted-in home whose primary is not Pi"
+  assert_contains "$drained" "[seq 1, recorded 0m ago] demo: PR ready for review" "a Claude home without config/supervision-host must present the captain outcome"
+
+  : > "$home/config/supervision-host"
+  drained=$(FM_HOME="$home" "$fakes/codex" -c '"$0" 2>&1' "$ROOT/bin/fm-wake-drain.sh")
+  assert_contains "$drained" "[seq 1, recorded 0m ago] demo: PR ready for review" "a Codex home with config/supervision-host must present the captain outcome"
+  pass "drain: BRANCH OUTCOMES runs on a Claude home by default and on another primary with the file, never with off, and never on Pi"
 }
 
 # A fresh captain outcome is never hidden behind older routine outcomes: the
@@ -1165,6 +1177,47 @@ test_claude_stop_hook_rewakes_a_present_captain_beside_a_quiet_record() {
   drained=$(main_drain "$home")
   assert_contains "$drained" " ago] demo: stub escalated: " "main's drain must present the captain outcome beside a quiet record"
   pass "host+hook: a captain outcome beside a quiet record rewakes the present captain with no away note"
+}
+
+# Default-on for Claude (docs/configuration.md "Supervision host"): through the
+# real Stop hook and mirror writer, a Claude primary home with no
+# config/supervision-host runs the host at the default engine, mirrors the
+# captain's dialog, and keeps a routine attended wake off main; a home whose
+# file says off runs the plain watcher arm, mirrors nothing, and every wake
+# reaches main as the arm printed it.
+test_claude_stop_hook_runs_the_host_without_the_file_and_off_opts_out() {
+  local home first
+  home=$(make_primary_home hook-default-on)
+  ln -s "$ROOT/.agents" "$home/.agents"
+  rm -f "$home/config/supervision-host"
+  start_hook_session "$home"
+  turn_end "$home"
+  wait_until 150 watcher_live "$home" || fail "default-on: the Stop hook never started a watcher cycle: $(cat "$home/hook.err" 2>/dev/null)"
+  assert_grep 'watch the fleet for me' "$home/state/.host-mirror.jsonl" "a Claude home without the file must mirror the captain's dialog"
+  append_status "$home" 'step one'
+  wait_until 250 handled_at_least "$home" 1 \
+    || fail "default-on: the wake was not handled on the engine: $(cat "$home/hook.err" 2>/dev/null; cat "$home/state/.supervision-host.log" 2>/dev/null)"
+  first="$home/engine-call.1"
+  assert_re '^arg=sonnet$' "$first" "a Claude home without the file must run the Claude engine at its default model"
+  assert_re '^primary=claude$' "$first" "the engine must carry the Claude primary pin"
+  assert_re '	handled	turn=[^	]*	posture=attended	' "$home/state/.supervision-host.log" "the ledger must record the attended turn"
+  [ ! -s "$home/hook.rc" ] || fail "a routine attended wake on a Claude home without the file reached main: $(cat "$home/hook.err")"
+  watcher_live "$home" || fail "default-on: the host is not parked on a live successor"
+
+  home=$(make_primary_home hook-opted-out)
+  printf 'off\n' > "$home/config/supervision-host"
+  start_hook_session "$home"
+  turn_end "$home"
+  wait_until 150 watcher_live "$home" || fail "off: the Stop hook never started a watcher cycle: $(cat "$home/hook.err" 2>/dev/null)"
+  append_status "$home" 'step one'
+  wait_until 250 hook_exited "$home" || fail "off: the Stop hook never closed"
+  assert_rewoke_main "$home" "off"
+  assert_re '^signal: .*demo.status' "$home/hook.err" "off: the rewake must carry the arm's close"
+  assert_no_re '^supervision-host' "$home/hook.err" "off: the close must reach main exactly as the arm printed it"
+  assert_absent "$home/state/.supervision-host.log" "a home whose file says off must never run the host"
+  assert_absent "$home/state/.host-mirror.jsonl" "a home whose file says off must mirror nothing"
+  [ "$(engine_calls "$home")" -eq 0 ] || fail "a home whose file says off ran an engine turn"
+  pass "host+hook: a Claude home without config/supervision-host runs the host at the default engine, and an off file restores the plain arm"
 }
 
 test_claude_stop_hook_delivers_a_close_that_turns_main_only_at_its_turn() {
@@ -2327,17 +2380,17 @@ test_latch_keeps_attended_closes_on_main_and_skips_unopted_homes() {
   [ "$(cat "$home/state/.supervision-host-health")" = "$health" ] || fail "an attended close changed the latch"
   main_drain_and_ack "$home"
 
-  rm -f "$home/config/supervision-host"
+  printf 'off\n' > "$home/config/supervision-host"
   FM_HOME="$home" "$CONTRACT" enter --words 'watch the fleet; merge nothing' >/dev/null 2>&1 \
     || fail "fixture: could not record the away posture again"
   park_again "$home"
-  append_status "$home" 'away without the file'
-  wait_until 250 host_exited "$home" || fail "latch scope: the close without the file did not reach main"
-  assert_re '^supervision-host: the home no longer opts into the supervision host$' "$home/host.out" \
-    "a home without the file must hand the close back as the opt-out, not the latch"
-  assert_no_re 'paused' "$home/host.out" "a home without the file must not read the latch"
+  append_status "$home" 'away after opting out'
+  wait_until 250 host_exited "$home" || fail "latch scope: the close after the opt-out did not reach main"
+  assert_re '^supervision-host: the home no longer runs the supervision host$' "$home/host.out" \
+    "a home whose file says off must hand the close back as the opt-out, not the latch"
+  assert_no_re 'paused' "$home/host.out" "a home whose file says off must not read the latch"
   [ "$(engine_calls "$home")" -eq 2 ] || fail "an engine ran after the latch tripped"
-  pass "host: an attended close in a latched session reaches main as the arm printed it and leaves the latch as it was, and a home without config/supervision-host never reads it"
+  pass "host: an attended close in a latched session reaches main as the arm printed it and leaves the latch as it was, and a home that opted out with off never reads it"
 }
 
 # The 2026-09-25 away-window flood: a held, green PR on a finished task was
@@ -2487,7 +2540,7 @@ test_superseded_host_leaves_the_owner_untouched() {
 test_report_surface_enforces_actor_turn_and_scope
 test_report_after_the_return_is_queued_for_main
 test_dispatch_entry_scopes_rows_and_renders_the_away_tail
-test_branch_outcomes_only_on_an_opted_in_home_off_pi
+test_branch_outcomes_only_on_a_host_home_off_pi
 test_branch_outcomes_put_captain_first_and_collapse_routine_overflow
 test_branch_outcomes_collapse_repeated_captain_outcomes_per_task
 test_branch_outcomes_present_a_long_away_window_once
@@ -2512,6 +2565,7 @@ test_close_accepted_away_that_turns_attended_passes_to_main
 test_attended_close_that_turns_main_only_before_its_turn_passes_to_main
 test_claude_stop_hook_delivers_a_main_only_pass_through
 test_claude_stop_hook_rewakes_a_present_captain_beside_a_quiet_record
+test_claude_stop_hook_runs_the_host_without_the_file_and_off_opts_out
 test_claude_stop_hook_delivers_a_close_that_turns_main_only_at_its_turn
 test_claude_stop_hook_notifies_when_at_turn_downtime_write_fails
 test_successor_close_during_main_turn_is_delivered_at_the_next_turn_end
