@@ -152,7 +152,9 @@ EOF
 # checked later, by the feed that renders the wake.
 fm_supervision_host_attended_ready() {
   FM_SUPERVISION_HOST_UNREADY=
-  if ! fm_supervision_host_config "$1" "$2" || [ -z "$FM_SUPERVISION_ENGINE" ]; then
+  if ! fm_supervision_host_config "$1" "$2"; then
+    FM_SUPERVISION_HOST_UNREADY="the home does not run the supervision host"
+  elif [ -z "$FM_SUPERVISION_ENGINE" ]; then
     FM_SUPERVISION_HOST_UNREADY="no supervision engine"
   elif ! fm_supervision_engine_bin "$FM_SUPERVISION_ENGINE" >/dev/null 2>&1; then
     FM_SUPERVISION_HOST_UNREADY="the $FM_SUPERVISION_ENGINE engine executable is missing"

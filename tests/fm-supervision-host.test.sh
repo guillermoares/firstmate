@@ -973,6 +973,26 @@ test_attended_main_only_close_passes_straight_to_main() {
   pass "host: an attended decision close stays main's exactly as the plain arm delivers it"
 }
 
+# The file is read at every wake (docs/configuration.md "Supervision host"), so
+# an off written while the host is parked sends the next attended close to main
+# exactly as the arm printed it, with the ledger naming the opt-out.
+test_off_written_while_parked_passes_the_next_attended_close_to_main() {
+  local home
+  home=$(make_home attended-off-while-parked attended)
+  start_host "$home"
+  wait_until 150 watcher_live "$home" || fail "off while parked: the host never started a watcher cycle"
+  printf 'off\n' > "$home/config/supervision-host"
+  append_status "$home" 'step one'
+  wait_until 250 host_exited "$home" || fail "off while parked: the close did not reach main: $(cat "$home/state/.supervision-host.log")"
+  expect_code 0 "$(cat "$home/host.rc")" "a close on a home that opted out must exit 0"
+  assert_re '^signal: .*demo.status' "$home/host.out" "the close must carry the watcher's reason line"
+  assert_no_re '^supervision-host' "$home/host.out" "the close must reach main exactly as the arm printed it"
+  [ "$(engine_calls "$home")" -eq 0 ] || fail "off while parked: the engine ran after the home opted out"
+  assert_re '	pass-through	attended	the home does not run the supervision host	signal:' "$home/state/.supervision-host.log" \
+    "the ledger must name the opt-out as why the close went to main"
+  pass "host: an off written while the host is parked sends the next attended close to main, naming the opt-out"
+}
+
 # The live failure this guards: a main-only pass-through used to exit without
 # a watcher, so nothing restarted short-lived listeners until the session
 # armed again. The close still reaches main unchanged, and the successor
@@ -2559,6 +2579,7 @@ test_attended_captain_outcome_reaches_main_through_branch_outcomes
 test_captain_leaving_mid_turn_keeps_its_captain_outcome_for_the_return
 test_quiet_record_without_its_daemon_is_a_present_captain
 test_attended_main_only_close_passes_straight_to_main
+test_off_written_while_parked_passes_the_next_attended_close_to_main
 test_main_only_pass_through_leaves_the_successor_watcher_running
 test_attended_close_with_unidentified_main_session_passes_to_main
 test_close_accepted_away_that_turns_attended_passes_to_main
