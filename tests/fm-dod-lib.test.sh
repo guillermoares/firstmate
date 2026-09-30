@@ -382,6 +382,67 @@ test_pr_based_dod_draft_check_uses_gh_axi() {
   pass "PR-based DoD draft check uses gh-axi"
 }
 
+# Skipping only ci must not loosen the ready gate: the no-CI ready report is
+# still a CI-ready report, so the worker copy's HEAD has to be one the run
+# pushed, and a bad ci state is refused rather than rendered.
+test_no_ci_ready_report_is_still_gated_on_the_pushed_head() {
+  local repo wt sha reason rc line
+  line='done: PR https://gitlab.com/g/p/-/merge_requests/7 checks green (no CI configured)'
+  repo="$TMP_ROOT/noci-repo"
+  wt="$TMP_ROOT/noci-wt"
+  fm_git_worktree "$repo" "$wt" fm/noci
+  git -C "$wt" commit -q --allow-empty -m 'fix only in the worktree'
+  sha=$(git -C "$wt" rev-parse HEAD)
+  reason=$(accept_done ship no-mistakes "$wt" "$repo" "$line")
+  rc=$?
+  [ "$rc" -eq 1 ] || fail "a no-CI ready report with an unpushed head was accepted (exit $rc)"
+  case "$reason" in
+    *"named head $sha is unreachable outside the worker copy") ;;
+    *) fail "no-CI refusal did not name the unpushed commit: $reason" ;;
+  esac
+  git -C "$wt" update-ref refs/remotes/origin/fm/noci "$sha"
+  accept_done ship no-mistakes "$wt" "$repo" "$line" \
+    || fail "a no-CI ready report with a pushed head was refused"
+  pass "the no-CI ready report keeps the pushed-head gate"
+}
+
+test_ci_state_argument_is_closed_and_scoped() {
+  local out rc mode
+  out=$(fm_dod_block no-mistakes ci-arg-task fm/ci-arg-task none maybe 2>&1); rc=$?
+  [ "$rc" -ne 0 ] || fail "an unknown ci state was rendered"
+  assert_contains "$out" "unknown ci state 'maybe'" "the refusal did not name the bad ci state"
+
+  # Only a no-mistakes block on forge none changes for ci=absent.
+  for mode in direct-PR local-only; do
+    [ "$(fm_dod_block "$mode" ci-arg-task fm/ci-arg-task none absent)" = "$(fm_dod_block "$mode" ci-arg-task fm/ci-arg-task none present)" ] \
+      || fail "$mode rendered differently for ci=absent"
+  done
+  [ "$(fm_dod_block no-mistakes ci-arg-task fm/ci-arg-task gerrit absent)" = "$(fm_dod_block no-mistakes ci-arg-task fm/ci-arg-task gerrit present)" ] \
+    || fail "the gerrit no-mistakes block rendered differently for ci=absent"
+  [ "$(fm_dod_block no-mistakes ci-arg-task fm/ci-arg-task none)" = "$(fm_dod_block no-mistakes ci-arg-task fm/ci-arg-task none present)" ] \
+    || fail "an omitted ci state did not default to present"
+  pass "fm_dod_block: the ci state is a closed set and changes only the no-mistakes block on forge none"
+}
+
+test_ci_state_is_absent_only_on_positive_evidence() {
+  local clone
+  clone="$TMP_ROOT/ci-state-clone"
+  git init -q -b main "$clone"
+  printf 'code\n' > "$clone/README.md"
+  git -C "$clone" add -A
+  git -C "$clone" commit -q -m init
+  git -C "$clone" remote add origin git@github.com:o/r.git
+  git -C "$clone" update-ref refs/remotes/origin/main HEAD
+  git -C "$clone" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+  [ "$(fm_dod_ci_state no-mistakes none "$clone")" = absent ] || fail "a no-CI GitHub clone did not read absent"
+  [ "$(fm_dod_ci_state direct-PR none "$clone")" = present ] || fail "direct-PR read absent"
+  [ "$(fm_dod_ci_state local-only none "$clone")" = present ] || fail "local-only read absent"
+  [ "$(fm_dod_ci_state no-mistakes gerrit "$clone")" = present ] || fail "the gerrit forge read absent"
+  [ "$(fm_dod_ci_state no-mistakes none "$TMP_ROOT/no-such-clone")" = present ] || fail "a missing clone read absent"
+  [ "$(fm_dod_ci_state no-mistakes none '')" = present ] || fail "an empty project read absent"
+  pass "fm_dod_ci_state: absent only for a no-mistakes ship on forge none with positive evidence"
+}
+
 test_scout_done_is_not_gated
 test_unpushed_ship_done_is_refused
 test_no_mistakes_prevalidation_done_is_not_gated
@@ -400,5 +461,8 @@ test_standalone_local_only_needs_project_ref
 test_non_done_lines_are_not_gated
 test_fenced_and_indented_captain_lines_are_not_intent
 test_pr_based_dod_draft_check_uses_gh_axi
+test_no_ci_ready_report_is_still_gated_on_the_pushed_head
+test_ci_state_argument_is_closed_and_scoped
+test_ci_state_is_absent_only_on_positive_evidence
 
 echo "all fm-dod-lib tests passed"
