@@ -509,10 +509,44 @@ fm_backlog_start() {  # <data-dir> <id>
   fm_backlog_mutate "$1" start "$2"
 }
 
+# tasks-axi accepts only a GitHub pull request URL or a Forgejo /pulls/<n> URL as
+# a task's --pr link and rejects anything else (a GitLab merge request, a Gerrit
+# change) with "Task pr link must be a canonical pull request URL". It is external,
+# so every --pr link is checked here before it is handed over; this is the one
+# place that knows the accepted shapes, and it is deliberately self-contained
+# because sandboxes source this library without bin/fm-pr-lib.sh.
+fm_backlog_pr_link_accepted() {  # <url>
+  local url=${1-} pattern
+  local LC_ALL=C
+  pattern='^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[1-9][0-9]*$'
+  [[ "$url" =~ $pattern ]] && return 0
+  pattern='^https://[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pulls/[1-9][0-9]*$'
+  [[ "$url" =~ $pattern ]]
+}
+
+# Rewrite a `--pr <url>` pair tasks-axi would reject into `--note "Merged <url>"`,
+# so the item still closes atomically and the link stays recorded. Sets
+# FM_BACKLOG_ARGS_NORMALIZED; every other flag passes through unchanged.
+FM_BACKLOG_ARGS_NORMALIZED=()
+fm_backlog_normalize_done_args() {  # [flag...]
+  local arg previous_arg=''
+  FM_BACKLOG_ARGS_NORMALIZED=()
+  for arg in "$@"; do
+    if [ "$previous_arg" = --pr ] && ! fm_backlog_pr_link_accepted "$arg"; then
+      FM_BACKLOG_ARGS_NORMALIZED[${#FM_BACKLOG_ARGS_NORMALIZED[@]}-1]=--note
+      FM_BACKLOG_ARGS_NORMALIZED+=("Merged $arg")
+    else
+      FM_BACKLOG_ARGS_NORMALIZED+=("$arg")
+    fi
+    previous_arg=$arg
+  done
+}
+
 fm_backlog_done() {  # <data-dir> <id> [flag...]
   local data=$1 id=$2
   shift 2
-  fm_backlog_mutate "$data" "done" "$id" "$@"
+  fm_backlog_normalize_done_args "$@"
+  fm_backlog_mutate "$data" "done" "$id" "${FM_BACKLOG_ARGS_NORMALIZED[@]+"${FM_BACKLOG_ARGS_NORMALIZED[@]}"}"
 }
 
 fm_backlog_row_artifact_supported() {
@@ -551,7 +585,10 @@ fm_backlog_retain() {  # <data-dir> <id> [flag...]
         ;;
       --pr)
         deliverable="${deliverable:+$deliverable; }PR $arg"
-        row_args=(--pr "$arg")
+        # A link tasks-axi rejects stays in the body line above only.
+        if fm_backlog_pr_link_accepted "$arg"; then
+          row_args=(--pr "$arg")
+        fi
         ;;
       --note) deliverable="${deliverable:+$deliverable; }$arg" ;;
     esac
