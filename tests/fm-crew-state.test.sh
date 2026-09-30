@@ -1149,6 +1149,24 @@ test_gate_block_parked_not_superseded() {
   pass "gate block parked run is not flagged superseded"
 }
 
+# The no-CI ready report (ci skipped, PR open) reads done through the same path
+# as a CI-ready report, and the run that skipped ci ends passed-with-skips.
+test_no_ci_ready_report_reads_done_after_a_skipped_ci_run() {
+  reset_fakes
+  local d; d=$(new_case no-ci-ready)
+  make_repo_on_branch "$d/wt" fm/feat-noci
+  git -C "$d/wt" update-ref refs/remotes/origin/fm/feat-noci "$(git -C "$d/wt" rev-parse HEAD)"
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-noci.meta" "window=fm:fm-feat-noci" "worktree=$d/wt" "kind=ship"
+  printf 'done: PR https://gitlab.com/g/p/-/merge_requests/7 checks green (no CI configured)\n' > "$d/state/feat-noci.status"
+  FM_FAKE_AXI_STATUS="$(run_passed_with_skips fm/feat-noci)"
+  local out; out=$(run_crew_state "$d" feat-noci)
+  assert_contains "$out" "state: done" "no-CI ready report on a passed-with-skips run -> done"
+  assert_not_contains "$out" "state: working" "a skipped ci step must not leave the run reading as still validating"
+  assert_not_contains "$out" "state: unknown" "a skipped ci step must not fall through to unknown"
+  pass "no-CI ready report reads done after a run that skipped ci"
+}
+
 test_ci_ready_done_log_beats_monitoring_run() {
   reset_fakes
   local d; d=$(new_case ci-ready)
@@ -5531,6 +5549,7 @@ test_parked_human_decision_comes_from_the_action_column
 test_scalar_gate_parked_not_superseded
 test_gate_block_parked_not_superseded
 test_ci_ready_done_log_beats_monitoring_run
+test_no_ci_ready_report_reads_done_after_a_skipped_ci_run
 test_ci_monitoring_checks_green_surfaces_done
 test_top_level_ci_checks_green_surfaces_done
 test_ci_monitoring_no_checks_terminal_surfaces_done
