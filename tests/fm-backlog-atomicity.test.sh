@@ -1571,6 +1571,69 @@ test_completion_closes_a_local_only_ship_before_reporting_success() {
   pass "completion closes a local-only ship, with its landing note, before reporting success"
 }
 
+test_completion_closes_a_gitlab_merge_request_through_the_note() {
+  local case_dir id out mr
+  id=atomic-close-gitlab-b5
+  mr=https://gitlab.example.com/group/sub/project/-/merge_requests/7
+  case_dir=$(make_home close-gitlab-mr)
+  add_item "$case_dir" "$id"
+  start_item "$case_dir" "$id"
+  write_task_meta "$case_dir" "$id" ship direct-PR "spawn_gen=spawn-close-gitlab"
+  printf 'pr=%s\n' "$mr" >> "$(home_of "$case_dir")/state/$id.meta"
+
+  out=$(run_teardown "$case_dir" "$id") || fail "GitLab teardown failed: $out"
+  [ "$(row_state "$case_dir" "$id")" = "done" ] \
+    || fail "a GitLab merge request left the item $(row_state "$case_dir" "$id"): $out"
+  assert_grep "Merged $mr" "$(backlog_of "$case_dir")" \
+    "a GitLab merge request close did not keep its link in the note"
+  assert_absent "$(home_of "$case_dir")/state/$id.backlog-close" \
+    "a GitLab merge request close left a pending-close record"
+  pass "completion closes a GitLab merge request through a note, not the rejected --pr link"
+}
+
+test_completion_keeps_a_github_pull_request_on_the_pr_link() {
+  local case_dir id out pr
+  id=atomic-close-github-b5
+  pr=https://github.com/example/firstmate/pull/21
+  case_dir=$(make_home close-github-pr)
+  add_item "$case_dir" "$id"
+  start_item "$case_dir" "$id"
+  write_task_meta "$case_dir" "$id" ship direct-PR "spawn_gen=spawn-close-github"
+  printf 'pr=%s\n' "$pr" >> "$(home_of "$case_dir")/state/$id.meta"
+
+  out=$(run_teardown "$case_dir" "$id") || fail "GitHub teardown failed: $out"
+  [ "$(row_state "$case_dir" "$id")" = "done" ] \
+    || fail "a GitHub pull request left the item $(row_state "$case_dir" "$id"): $out"
+  assert_grep "$pr" "$(backlog_of "$case_dir")" \
+    "a GitHub pull request close lost its link"
+  assert_no_grep "Merged $pr" "$(backlog_of "$case_dir")" \
+    "a GitHub pull request close was rewritten into a note"
+  pass "completion keeps a GitHub pull request on the --pr link"
+}
+
+test_recovery_replays_a_gitlab_close_recorded_with_the_rejected_pr_link() {
+  local case_dir id out mr
+  id=atomic-heal-gitlab-b9
+  mr=https://gitlab.example.com/group/project/-/merge_requests/9
+  case_dir=$(make_home heal-gitlab-mr)
+  add_item "$case_dir" "$id"
+  start_item "$case_dir" "$id"
+  printf 'id=%s\ndata=%s\nspawn_gen=spawn-heal-gitlab\narg=--pr\narg=%s\n' \
+    "$id" "$(home_of "$case_dir")/data" "$mr" \
+    > "$(home_of "$case_dir")/state/$id.backlog-close"
+
+  out=$(run_bootstrap "$case_dir")
+  [ "$(row_state "$case_dir" "$id")" = "done" ] \
+    || fail "session start left a recorded GitLab close at $(row_state "$case_dir" "$id"): $out"
+  assert_grep "Merged $mr" "$(backlog_of "$case_dir")" \
+    "the replayed GitLab close dropped its link"
+  assert_absent "$(home_of "$case_dir")/state/$id.backlog-close" \
+    "a replayed GitLab close left its record behind"
+  assert_not_contains "$out" "BACKLOG_RECONCILE" \
+    "a replayed GitLab close left a startup warning"
+  pass "session start replays a recorded GitLab --pr close through the note"
+}
+
 test_completion_closes_a_scout_with_its_report() {
   local case_dir id out
   id=atomic-close-b6
@@ -3038,6 +3101,8 @@ test_dispatch_does_not_resurrect_a_row_closed_after_preflight
 test_dispatch_fails_when_its_row_vanishes_after_preflight
 test_completion_closes_a_local_only_ship_before_reporting_success
 test_completion_closes_a_scout_with_its_report
+test_completion_closes_a_gitlab_merge_request_through_the_note
+test_completion_keeps_a_github_pull_request_on_the_pr_link
 test_completion_refuses_a_legacy_record_without_an_incarnation
 test_completion_refuses_ambiguous_incarnation_metadata
 test_completion_records_a_relative_report_for_relocated_data
@@ -3056,6 +3121,7 @@ test_recovery_marks_an_owned_record_in_flight
 test_recovery_rejects_an_internal_worker_record_symlink
 test_recovery_ignores_a_symlinked_worker_record
 test_recovery_replays_a_close_an_interrupted_cleanup_left_open
+test_recovery_replays_a_gitlab_close_recorded_with_the_rejected_pr_link
 test_recovery_backfills_a_recorded_link_on_an_already_done_item
 test_recovery_preserves_a_close_when_the_backlog_cannot_be_read
 test_recovery_retry_preserves_incomplete_cleanup_warning
