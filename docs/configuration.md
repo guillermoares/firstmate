@@ -487,6 +487,7 @@ Backend guides and other documents refer here instead of restating the resolutio
 
 `fm-teardown.sh <id>` takes a task id directly and validates the complete metadata-only endpoint identity before any runtime dispatch or cleanup mutation.
 Missing, empty, duplicate, malformed, backend-inconsistent, or task-mismatched endpoint records are preserved and refused.
+After its safety refusals pass, teardown also removes the task folder `${TMPDIR:-/tmp}/fm-workspaces/<branch>` (the worktree branch with every `/` replaced by `__`), warning but never failing if removal fails.
 
 Legacy tmux metadata remains cleanup-compatible when its exact window name is `fm-<id>`; opaque non-tmux endpoints require their recorded `endpoint_task_id=` binding.
 
