@@ -556,6 +556,111 @@ test_primary_update_rebinds_local_watch() {
   pass "T12 a self-update rebinds a locally armed watch on the primary"
 }
 
+# Give the world a bare "fork" remote carrying a local-fixes branch, and put the
+# primary checkout on that branch tracking it. Echoes nothing.
+add_fork() {
+  local w=$1
+  git init -q --bare "$w/fork.git"
+  git -C "$w/main" remote add fork "$w/fork.git"
+  git -C "$w/main" checkout -q -b local-fixes
+  git -C "$w/main" push -q fork local-fixes
+}
+
+# Advance fork's local-fixes by one commit from a scratch clone.
+bump_fork() {
+  local w=$1
+  rm -rf "$w/forkwork"
+  git clone -q -b local-fixes "$w/fork.git" "$w/forkwork" 2>/dev/null
+  printf 'fork-change\n' >> "$w/forkwork/README.md"
+  git -C "$w/forkwork" add -A
+  git -C "$w/forkwork" commit -qm fork-bump
+  git -C "$w/forkwork" push -q origin local-fixes
+  git -C "$w/forkwork" rev-parse HEAD
+}
+
+test_configured_source_updates_from_fork_only() {
+  local w out fork_tip origin_before
+  w=$(new_world fork-source)
+  add_fork "$w"
+  mkdir -p "$w/home/config"
+  printf 'fork local-fixes\n' > "$w/home/config/update-source"
+  fork_tip=$(bump_fork "$w")
+  bump_origin "$w" instr
+  origin_before=$(git -C "$w/main" rev-parse origin/main)
+
+  out=$(run_update "$w")
+
+  assert_contains "$out" "firstmate: updated " "the primary advanced from the configured fork"
+  assert_equals "$(git -C "$w/main" rev-parse HEAD)" "$fork_tip" "HEAD is exactly the fork tip"
+  assert_equals "$(git -C "$w/main" rev-parse origin/main)" "$origin_before" "origin was never fetched"
+  assert_equals "$(git -C "$w/main" rev-list --merges --count HEAD)" "0" "no merge commit was created"
+  out=$(run_update "$w")
+  assert_contains "$out" "firstmate: already current" "a second pass is already current"
+  pass "T13 a configured fork source advances the checkout and never touches origin"
+}
+
+test_configured_source_diverged_from_fork_skipped() {
+  local w out
+  w=$(new_world fork-diverged)
+  add_fork "$w"
+  mkdir -p "$w/home/config"
+  printf 'fork local-fixes\n' > "$w/home/config/update-source"
+  bump_fork "$w" >/dev/null
+  printf 'local\n' > "$w/main/local.txt"
+  git -C "$w/main" add -A
+  git -C "$w/main" commit -qm local-only
+  local before
+  before=$(git -C "$w/main" rev-parse HEAD)
+  out=$(run_update "$w")
+  assert_contains "$out" "firstmate: skipped: diverged from fork/local-fixes" "divergence from the fork is reported"
+  assert_equals "$(git -C "$w/main" rev-parse HEAD)" "$before" "the diverged checkout was not moved"
+  pass "T14 a checkout diverged from the configured source is skipped"
+}
+
+test_unset_source_keeps_origin_behavior() {
+  local w out
+  w=$(new_world fork-unset)
+  add_fork "$w"
+  git -C "$w/main" checkout -q main
+  bump_origin "$w" readme
+  out=$(run_update "$w")
+  assert_contains "$out" "firstmate: updated " "with no setting the primary still follows origin"
+  assert_equals "$(git -C "$w/main" rev-parse HEAD)" "$(git -C "$w/origin.git" rev-parse main)" "HEAD is origin's tip"
+  pass "T15 an unset source keeps the origin default-branch behavior"
+}
+
+test_missing_configured_remote_skips_without_origin_fallback() {
+  local w out before
+  w=$(new_world fork-missing)
+  mkdir -p "$w/home/config"
+  printf 'nosuch main\n' > "$w/home/config/update-source"
+  bump_origin "$w" instr
+  before=$(git -C "$w/main" rev-parse HEAD)
+  out=$(run_update "$w")
+  assert_contains "$out" "firstmate: skipped: no nosuch remote" "a missing configured remote is reported"
+  assert_equals "$(git -C "$w/main" rev-parse HEAD)" "$before" "origin was not used as a fallback"
+  printf 'onlyone\n' > "$w/home/config/update-source"
+  out=$(run_update "$w")
+  assert_contains "$out" "firstmate: skipped: config/update-source must hold" "a malformed setting is reported"
+  assert_equals "$(git -C "$w/main" rev-parse HEAD)" "$before" "a malformed setting does not fall back to origin"
+  pass "T16 a missing or malformed configured source skips safely"
+}
+
+test_configured_source_updates_secondmate() {
+  local w out fork_tip
+  w=$(new_world fork-secondmate)
+  add_fork "$w"
+  mkdir -p "$w/home/config"
+  printf 'fork local-fixes\n' > "$w/home/config/update-source"
+  add_sm "$w" sm1
+  fork_tip=$(bump_fork "$w")
+  bump_origin "$w" instr
+  out=$(run_update "$w")
+  assert_contains "$out" "secondmate sm1: updated " "the secondmate followed the fork"
+  assert_equals "$(git -C "$w/sm1" rev-parse HEAD)" "$fork_tip" "secondmate HEAD is the fork tip"
+  pass "T17 a configured source also drives local secondmate updates"
+}
+
 test_updates_main_and_secondmate
 test_reread_gate_is_instruction_only
 test_bin_only_advance_restarts
@@ -572,5 +677,10 @@ test_firstmate_wrong_branch_skipped
 test_firstmate_detached_head_skipped
 test_unsafe_secondmate_home_skipped_before_git_update
 test_primary_update_rebinds_local_watch
+test_configured_source_updates_from_fork_only
+test_configured_source_diverged_from_fork_skipped
+test_unset_source_keeps_origin_behavior
+test_missing_configured_remote_skips_without_origin_fallback
+test_configured_source_updates_secondmate
 
 echo "# all fm-update tests passed"

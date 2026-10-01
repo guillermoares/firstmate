@@ -351,8 +351,9 @@ import_home_commit() { # <home> <commit>
     && git -C "$home" cat-file -e "$commit^{commit}" 2>/dev/null; then
     return 0
   fi
-  if git -C "$home" remote get-url origin >/dev/null 2>&1 \
-    && git -C "$home" fetch --quiet --no-tags -- origin "$commit" 2>/dev/null \
+  update_source_load
+  if [ -z "$UPDATE_SOURCE_ERR" ] && git -C "$home" remote get-url "$UPDATE_REMOTE" >/dev/null 2>&1 \
+    && git -C "$home" fetch --quiet --no-tags -- "$UPDATE_REMOTE" "$commit" 2>/dev/null \
     && git -C "$home" cat-file -e "$commit^{commit}" 2>/dev/null; then
     return 0
   fi
