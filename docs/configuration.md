@@ -12,6 +12,7 @@ Start with the directory layout, then use the setting reference for the behavior
 | Worker permissions, accounts, or environment | [Claude permission mode](#claude-permission-mode-configclaude-permission-mode), [worker account pin](#worker-account-pin-configclaude-account-configpi-account), and [worker launch environment](#worker-launch-environment-configlaunch-env-allowlist) |
 | Backlog, preferences, and memory | [Backlog backend](#backlog-backend-taskstoml--configbacklog-backend), [captain preferences](#captain-preferences-datacaptainmd--datacaptain-sharedmd), and [startup memory budget](#startup-memory-budget-configstartup-memory-budget) |
 | Supervision and presentation | [Pi supervision branch](#pi-supervision-branch), [supervision host](#supervision-host-configsupervision-host), and [Calm preference](#calm-preference-configcalm) |
+| Where /updatefirstmate pulls from | [Update source](#update-source-configupdate-source) |
 | Persistent secondmates | [Secondmate routes](#secondmate-routes-datasecondmatesmd) |
 | Per-run overrides and tuning | [Environment variables](#environment-variables) |
 
@@ -562,6 +563,16 @@ A Secondmate on a remote route is covered the same way: the primary resolves and
 
 The presence flag is session-scoped enablement, so it transfers at launch and is left unchanged by live convergence into a running home.
 See [`trace-context.md`](trace-context.md) for carrier semantics, supported routes, the manual fleet-restart requirement, the session boundary, and safety limits; `bin/fm-trace-context-lib.sh`'s header owns the exact mechanics, and [`verification/trace-context.md`](verification/trace-context.md) records repeatable evidence.
+
+## Update source (config/update-source)
+
+`/updatefirstmate` fast-forwards from `origin` and its default branch unless `$FM_HOME/config/update-source` names another source.
+The file is private and holds one line, `<remote> <branch>`, for example `fork local-fixes`.
+`bin/fm-update.sh` then fetches only that remote and uses `<remote>/<branch>` as the base for the primary checkout and every local or remote secondmate update, and expects each target to be on that branch (a secondmate home leased at a detached HEAD is still accepted).
+A remote the target does not have, or a malformed file, skips that target with a message and never falls back to `origin`.
+With no file, behavior is unchanged.
+Every update guard still applies: fast-forward only, never force, never a merge commit, never stash.
+This setting does not affect fleet sync or project clones.
 
 ## Fleet activity ledger (config/fleet-ledger)
 
