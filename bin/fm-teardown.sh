@@ -222,6 +222,9 @@
 # checks before any destructive return. Teardown output notes every wait, retry, and
 # removal so the operator can see what happened.
 #
+# Post-safety cleanup also removes the task's private build workspace
+# ${TMPDIR:-/tmp}/fm-workspaces/<branch> (the worktree branch with / replaced by __).
+#
 # Pre-teardown cleanup sequence (runs once every landed/discard-work safety
 # refusal above has already passed, and BEFORE any worktree return, branch
 # delete, or backend kill below - a still-active run or a leaked process may
@@ -3554,6 +3557,7 @@ if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   fi
   if [ -d "$WT" ]; then
     branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
+    TEARDOWN_TASK_BRANCH=$branch
     if [ "$branch" != "HEAD" ]; then
       if git -C "$WT" checkout --detach -q 2>/dev/null; then
         git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
@@ -3572,6 +3576,7 @@ elif [ "$KIND" != secondmate ] && ! teardown_owns_worktree; then
   :
 elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
+  TEARDOWN_TASK_BRANCH=$branch
   if [ "$branch" != "HEAD" ]; then
     if git -C "$WT" checkout --detach -q 2>/dev/null; then
       git -C "$WT" branch -D "$branch" >/dev/null 2>&1 || true
@@ -3709,6 +3714,27 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Remove the per-task temp root (/tmp/fm-<id>/, incl. its gotmp/) recorded by spawn.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -n "$TASK_TMP" ] && rm -rf "$TASK_TMP"
+# Remove the task's private build workspace ${TMPDIR:-/tmp}/fm-workspaces/<branch>
+# (branch with every / replaced by __), derived from the worktree's own branch.
+# Quiet when absent, refuses an empty, ".."-bearing or escaping name, and a failed
+# removal only warns, so an interrupted teardown replays the same step safely.
+teardown_remove_task_workspace() {  # <branch>
+  local name=${1//\//__} root
+  root=${TMPDIR:-/tmp}/fm-workspaces
+  case "$name" in
+    ''|HEAD|*..*) return 0 ;;
+  esac
+  [ -d "$root/$name" ] || return 0
+  root=$(cd "$root" 2>/dev/null && pwd -P) || return 0
+  [ -d "$root/$name" ] && [ ! -L "$root/$name" ] || return 0
+  case "$(cd "$root/$name" 2>/dev/null && pwd -P)" in
+    "$root"/?*) ;;
+    *) return 0 ;;
+  esac
+  rm -rf -- "$root/$name" || echo "warning: could not remove task workspace $root/$name" >&2
+  return 0
+}
+teardown_remove_task_workspace "${TEARDOWN_TASK_BRANCH:-}"
 # Retire only this Firstmate home's launch namespace. Its never-reused per-spawn
 # files leave the equal task-id namespace of every other home untouched.
 teardown_launch_home_token() {

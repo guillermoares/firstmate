@@ -3525,6 +3525,66 @@ test_leaked_worktree_process_is_reaped() {
   pass "a leaked descendant process rooted under the task's worktree is reaped by teardown, not left surviving"
 }
 
+test_task_workspace_removed_on_teardown() {
+  local case_dir rc tmp branch name
+  case_dir=$(make_case task-workspace)
+  write_meta "$case_dir" no-mistakes ship
+  land_shippable_commit "$case_dir"
+  tmp="$case_dir/tmpdir"
+  branch=$(git -C "$case_dir/wt" rev-parse --abbrev-ref HEAD)
+  name=${branch//\//__}
+  mkdir -p "$tmp/fm-workspaces/$name/gm-cli" "$tmp/fm-workspaces/other/gm-cli"
+  set +e
+  TMPDIR="$tmp" run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 0 "$rc" "task-workspace: teardown should succeed: $(cat "$case_dir/stderr")"
+  [ ! -e "$tmp/fm-workspaces/$name" ] || fail "task-workspace: workspace survived teardown"
+  [ -d "$tmp/fm-workspaces/other/gm-cli" ] || fail "task-workspace: sibling workspace was removed"
+  pass "teardown removes the task's fm-workspaces folder and leaves siblings"
+
+  case_dir=$(make_case task-workspace-missing)
+  write_meta "$case_dir" no-mistakes ship
+  land_shippable_commit "$case_dir"
+  set +e
+  TMPDIR="$case_dir/tmpdir" run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 0 "$rc" "task-workspace-missing: teardown should succeed"
+  ! grep -q 'task workspace' "$case_dir/stderr" || fail "task-workspace-missing: missing folder was not quiet"
+  pass "teardown is quiet when the task workspace folder does not exist"
+
+  case_dir=$(make_case task-workspace-refused)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "unpushed work"
+  tmp="$case_dir/tmpdir"
+  branch=$(git -C "$case_dir/wt" rev-parse --abbrev-ref HEAD)
+  name=${branch//\//__}
+  mkdir -p "$tmp/fm-workspaces/$name"
+  set +e
+  TMPDIR="$tmp" run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "task-workspace-refused: teardown should refuse"
+  [ -d "$tmp/fm-workspaces/$name" ] || fail "task-workspace-refused: workspace removed despite refusal"
+  pass "a refused teardown keeps the task workspace"
+
+  case_dir=$(make_case task-workspace-hostile)
+  write_meta "$case_dir" no-mistakes ship
+  land_shippable_commit "$case_dir"
+  tmp="$case_dir/tmpdir"
+  # Git refuses ".." in branch names, so the escape attempt is a symlinked task folder.
+  branch=$(git -C "$case_dir/wt" rev-parse --abbrev-ref HEAD)
+  name=${branch//\//__}
+  mkdir -p "$tmp/fm-workspaces" "$tmp/victim"
+  ln -s "$tmp/victim" "$tmp/fm-workspaces/$name"
+  set +e
+  TMPDIR="$tmp" run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  set -e
+  [ -d "$tmp/victim" ] || fail "task-workspace-hostile: the task folder escaped the workspace root"
+  pass "a task folder that escapes the workspace root is left alone"
+}
+
 test_leaked_tasktmp_process_is_reaped() {
   local case_dir rc pid
   case_dir=$(make_case leaked-tasktmp-reap)
@@ -4146,6 +4206,7 @@ test_not_found_status_after_abort_confirms_completion
 test_another_branchs_parked_run_is_never_touched
 test_own_autonomous_run_is_left_alone
 test_leaked_worktree_process_is_reaped
+test_task_workspace_removed_on_teardown
 test_leaked_tasktmp_process_is_reaped
 test_lsof_absent_reaps_tmux_process_group
 test_lsof_error_refuses_before_removal
