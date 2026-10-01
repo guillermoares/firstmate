@@ -229,6 +229,10 @@ fi
 # promoted no-mistakes worker that never received the ask-user escalation rule or
 # the --yes ban is the delivery hole this file used to leave open.
 INSTRUCTIONS="$DATA/$ID/ship-instructions.md"
+# The same no-CI detection an ordinary ship brief applies (bin/fm-dod-lib.sh
+# fm_dod_ci_state), so a promoted worker is not left to wait on checks that
+# cannot exist. A scout with no recorded project keeps the ordinary contract.
+PROMOTE_CI_STATE=$(fm_dod_ci_state "$MODE" "$FORGE" "${PROMOTE_PROJECT:-}")
 PROMOTION_ASK_USER_BLOCK=
 if [ "$MODE" = no-mistakes ]; then
   PROMOTION_ASK_USER_BLOCK=$(fm_ask_user_escalation_block "$DATA" "$ID")
@@ -260,7 +264,7 @@ EOF
     printf '%s\n' "$PROMOTION_ASK_USER_BLOCK"
   fi
   printf '\n'
-  fm_dod_block "$MODE" "$ID" "$BRANCH" "$FORGE"
+  fm_dod_block "$MODE" "$ID" "$BRANCH" "$FORGE" "$PROMOTE_CI_STATE"
 }
 mkdir -p "$DATA/$ID"
 [ ! -d "$INSTRUCTIONS" ] || { echo "error: ship instructions path is a directory: $INSTRUCTIONS" >&2; exit 1; }

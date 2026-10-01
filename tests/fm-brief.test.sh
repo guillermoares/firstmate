@@ -1325,6 +1325,166 @@ test_crewmate_scaffolds_forbid_pool_administration() {
   pass "fm-brief.sh: every crewmate scaffold forbids administering the shared worktree pool"
 }
 
+# A no-mistakes ship on a clone whose default branch provably has no CI must be
+# told to skip the pipeline's ci step (it would poll for checks that can never
+# appear), while still pushing and opening the PR. Every other shape - a CI file
+# of any kind, an unknown host, no clone, another mode, the Gerrit forge - must
+# render exactly the Definition of done it always did.
+make_ci_clone() {  # <home> <repo-name> <origin-url> [<ci-path>...]
+  local home=$1 name=$2 url=$3 dir path
+  shift 3
+  dir="$home/projects/$name"
+  git init -q -b main "$dir"
+  printf 'code\n' > "$dir/README.md"
+  for path in "$@"; do
+    mkdir -p "$dir/$(dirname "$path")"
+    printf 'ci\n' > "$dir/$path"
+  done
+  git -C "$dir" add -A
+  git -C "$dir" -c user.name=fmtest -c user.email=fmtest@example.invalid commit -q -m init
+  git -C "$dir" remote add origin "$url"
+  git -C "$dir" update-ref refs/remotes/origin/main HEAD
+  git -C "$dir" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+}
+
+dod_section() {  # <brief>
+  sed -n '/^# Definition of done/,$p' "$1"
+}
+
+ci_brief() {  # <home> <id> <repo> <mode> [fm-brief args...]
+  local home=$1 id=$2 repo=$3 mode=$4
+  shift 4
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" "$repo" --mode "$mode" "$@" >/dev/null 2>&1 \
+    || fail "fm-brief.sh $id --mode $mode $* failed"
+  printf '%s\n' "$home/data/$id/brief.md"
+}
+
+test_no_ci_clone_skips_the_ci_step() {
+  local home brief dod
+  home="$TMP_ROOT/ci-absent-home"
+  mkdir -p "$home/data"
+  make_ci_clone "$home" nociproj git@gitlab.com:group/nociproj.git
+  brief=$(ci_brief "$home" ci-absent-a1 nociproj no-mistakes)
+  dod=$(dod_section "$brief")
+
+  assert_contains "$dod" 'Delivery contract: mode=no-mistakes' "no-CI brief lost the delivery contract line"
+  grep -qx 'Delivery contract: mode=no-mistakes' "$brief" \
+    || fail "the no-CI contract line must stay exactly the mode line spawn checks"
+  # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+  assert_contains "$dod" 'Pass `--skip ci` on every `no-mistakes axi run`' "no-CI brief did not tell the worker to skip ci"
+  # shellcheck disable=SC2016
+  assert_contains "$dod" 'skip nothing else: `push` and `pr` still run' "no-CI brief did not keep push and pr running"
+  # shellcheck disable=SC2016
+  assert_contains "$dod" 'Then append `done [at=<epoch>]: PR {url} checks green (no CI configured)` and stop.' \
+    "no-CI brief did not name the no-CI ready report"
+  assert_contains "$dod" 'gh-axi pr ready <number>' "no-CI brief dropped the draft readback"
+  assert_contains "$dod" 'is one the /no-mistakes run pushed' "no-CI brief dropped the pushed-HEAD gate"
+  assert_contains "$dod" 'ask-user findings are never yours to answer' "no-CI brief dropped the ask-user rule"
+  assert_no_grep 'Only a drive call'"'"'s return reports the green PR' "$brief" \
+    "no-CI brief still waits on a green-PR drive return that a skipped ci step never gives"
+  assert_no_grep '--skip push' "$brief" "no-CI brief skipped push"
+  assert_no_grep '--skip ci,' "$brief" "no-CI brief skipped more than ci"
+  pass "fm-brief.sh: a no-CI GitLab clone skips only ci, still pushes and opens the PR, and keeps the gates"
+}
+
+test_no_ci_github_clone_skips_the_ci_step() {
+  local home brief
+  home="$TMP_ROOT/ci-absent-github-home"
+  mkdir -p "$home/data"
+  make_ci_clone "$home" ghproj https://github.com/owner/ghproj.git
+  brief=$(ci_brief "$home" ci-absent-gh ghproj no-mistakes)
+  # shellcheck disable=SC2016
+  assert_grep 'Pass `--skip ci` on every `no-mistakes axi run`' "$brief" "a no-CI GitHub clone did not skip ci"
+  pass "fm-brief.sh: a no-CI GitHub clone skips ci too"
+}
+
+test_any_ci_file_keeps_the_ordinary_contract() {
+  local home base_home entry n=0 brief base
+  base_home="$TMP_ROOT/ci-baseline-home"
+  mkdir -p "$base_home/data"
+  base=$(ci_brief "$base_home" ci-base-a1 ciproj no-mistakes)
+  for entry in .gitlab-ci.yml .github/workflows/ci.yml .circleci/config.yml Jenkinsfile \
+    azure-pipelines.yml .travis.yml bitbucket-pipelines.yml .drone.yml .buildkite/pipeline.yml; do
+    n=$((n + 1))
+    home="$TMP_ROOT/ci-present-home-$n"
+    mkdir -p "$home/data"
+    make_ci_clone "$home" ciproj git@gitlab.com:group/ciproj.git "$entry"
+    brief=$(ci_brief "$home" ci-base-a1 ciproj no-mistakes)
+    assert_no_grep '--skip ci' "$brief" "a clone with $entry was told to skip ci"
+    [ "$(dod_section "$brief")" = "$(dod_section "$base")" ] \
+      || fail "a clone with $entry changed the Definition of done"
+  done
+  pass "fm-brief.sh: every kind of CI file keeps the ordinary no-mistakes contract byte for byte"
+}
+
+test_unknown_ci_state_keeps_the_ordinary_contract() {
+  local home base_home brief base
+  base_home="$TMP_ROOT/ci-unknown-baseline-home"
+  mkdir -p "$base_home/data"
+  base=$(ci_brief "$base_home" ci-unk-a1 unkproj no-mistakes)
+
+  # No clone at all.
+  assert_no_grep '--skip ci' "$base" "a project with no clone was told to skip ci"
+
+  # An unknown forge host with no CI files.
+  home="$TMP_ROOT/ci-unknown-host-home"
+  mkdir -p "$home/data"
+  make_ci_clone "$home" unkproj https://git.example.org/group/unkproj.git
+  brief=$(ci_brief "$home" ci-unk-a1 unkproj no-mistakes)
+  [ "$(dod_section "$brief")" = "$(dod_section "$base")" ] \
+    || fail "an unknown forge host changed the Definition of done"
+
+  # A known host whose default branch cannot be read.
+  home="$TMP_ROOT/ci-unreadable-home"
+  mkdir -p "$home/data"
+  make_ci_clone "$home" unkproj git@github.com:owner/unkproj.git
+  git -C "$home/projects/unkproj" symbolic-ref --delete refs/remotes/origin/HEAD
+  brief=$(ci_brief "$home" ci-unk-a1 unkproj no-mistakes)
+  [ "$(dod_section "$brief")" = "$(dod_section "$base")" ] \
+    || fail "an unreadable default branch changed the Definition of done"
+  pass "fm-brief.sh: no clone, an unknown host, or an unreadable default branch keeps the ordinary contract"
+}
+
+test_no_ci_leaves_other_modes_and_forges_unchanged() {
+  local home base_home mode brief base
+  home="$TMP_ROOT/ci-other-shapes-home"
+  base_home="$TMP_ROOT/ci-other-shapes-baseline-home"
+  mkdir -p "$home/data" "$base_home/data"
+  make_ci_clone "$home" shapeproj git@gitlab.com:group/shapeproj.git
+
+  for mode in direct-PR local-only; do
+    brief=$(ci_brief "$home" "ci-shape-$mode" shapeproj "$mode")
+    base=$(ci_brief "$base_home" "ci-shape-$mode" shapeproj "$mode")
+    assert_no_grep '--skip ci' "$brief" "$mode was told to skip ci"
+    [ "$(dod_section "$brief")" = "$(dod_section "$base")" ] \
+      || fail "a no-CI clone changed the $mode Definition of done"
+  done
+
+  # The Gerrit forge already skips its forge-facing steps; detection must not
+  # touch that shape, for either publishing mode.
+  for mode in no-mistakes direct-PR; do
+    brief=$(ci_brief "$home" "ci-gerrit-$mode" shapeproj "$mode" --forge gerrit)
+    base=$(ci_brief "$base_home" "ci-gerrit-$mode" shapeproj "$mode" --forge gerrit)
+    [ "$(dod_section "$brief")" = "$(dod_section "$base")" ] \
+      || fail "a no-CI clone changed the Gerrit $mode Definition of done"
+  done
+  assert_grep '--skip push,pr,ci' "$home/data/ci-gerrit-no-mistakes/brief.md" \
+    "the Gerrit no-mistakes shape lost its own skip list"
+  pass "fm-brief.sh: direct-PR, local-only, and the Gerrit forge render the same with or without a CI-less clone"
+}
+
+test_dod_block_renders_both_ci_states() {
+  local dod_with dod_without
+  # fm_dod_block is the one renderer both fm-brief.sh and fm-promote.sh call.
+  dod_with=$(bash -c '. "$1/bin/fm-dod-lib.sh"; fm_dod_block no-mistakes t1 fm/t1 none absent' _ "$ROOT")
+  dod_without=$(bash -c '. "$1/bin/fm-dod-lib.sh"; fm_dod_block no-mistakes t1 fm/t1 none present' _ "$ROOT")
+  # shellcheck disable=SC2016
+  assert_contains "$dod_with" 'Pass `--skip ci` on every `no-mistakes axi run`' "the absent rendering did not skip ci"
+  assert_contains "$dod_without" 'checks green' "the present rendering lost the ordinary ready report"
+  case "$dod_without" in *--skip*) fail "the present rendering mentions a skip" ;; esac
+  pass "fm_dod_block: ci=absent and ci=present render the two contracts"
+}
+
 test_script_parses
 test_no_heredoc_in_command_substitution
 test_help_includes_entire_header
@@ -1359,3 +1519,9 @@ test_branch_prefix_is_refused_where_it_does_not_apply
 test_branch_prefix_value_is_validated
 test_branch_prefix_command_is_shell_safe
 test_crewmate_scaffolds_forbid_pool_administration
+test_no_ci_clone_skips_the_ci_step
+test_no_ci_github_clone_skips_the_ci_step
+test_any_ci_file_keeps_the_ordinary_contract
+test_unknown_ci_state_keeps_the_ordinary_contract
+test_no_ci_leaves_other_modes_and_forges_unchanged
+test_dod_block_renders_both_ci_states

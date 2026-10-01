@@ -6,7 +6,7 @@
 # receives. Both paths must hand the worker the same contract: a promoted
 # no-mistakes worker that never received the ask-user escalation rule or the
 # `--yes` ban is the exact delivery hole this single owner exists to close.
-# fm_dod_block <no-mistakes|direct-PR|local-only> <task-id> [branch] [<forge>]
+# fm_dod_block <no-mistakes|direct-PR|local-only> <task-id> [branch] [<forge>] [<ci>]
 # prints the block on stdout with no trailing blank line. The caller validates the
 # mode; an unknown mode is refused rather than silently rendered as the pipeline
 # contract.
@@ -95,6 +95,16 @@
 # ordinary ship brief and the durable contract written during scout promotion.
 # It takes the same optional trailing forge argument, because the rule that keeps
 # a worker off a remote is exactly the rule that changes when the forge does.
+# The optional fifth fm_dod_block argument is the ci state, `present` (default) or
+# `absent`; fm_dod_ci_state owns how a caller derives it. Only a no-mistakes block
+# on forge none renders differently for `absent`: the worker passes `--skip ci` on
+# every run, because the pipeline's ci step would poll forever for checks that
+# cannot exist, and its ready report is `done: PR <url> checks green (no CI
+# configured)` once the PR is open. That is the same skipped-step shape the
+# gerrit block uses, and the same ready report every other consumer already
+# reads: the named-head gate below still demands that the run pushed HEAD, because
+# only ci is skipped, never push or pr. Every other mode, forge, and unknown
+# state renders exactly as before.
 
 # shellcheck source=bin/fm-pr-lib.sh
 . "$(d=${BASH_SOURCE[0]%/*}; [ "$d" != "${BASH_SOURCE[0]}" ] || d=.; cd "${d:-/}" && pwd)/fm-pr-lib.sh"
@@ -278,10 +288,11 @@ EOF
 # The forge-independent middle of the no-mistakes contract: how a worker drives
 # the pipeline, what `--intent` may carry, and the two firstmate-specific rules.
 # Written once; only the two sentences about a green PR depend on the forge,
-# because on gerrit the ci step is skipped and there is no PR to report.
-fm_nm_driving_block() {  # <forge>
+# because on gerrit the ci step is skipped and there is no PR to report, and the
+# same holds when ci is absent: a skipped ci step never reports a green PR.
+fm_nm_driving_block() {  # <forge> [<ci>]
   local pr_return_line='' pr_reattach_clause=';'
-  if [ "$1" != gerrit ]; then
+  if [ "$1" != gerrit ] && [ "${2:-present}" != absent ]; then
     pr_return_line="Only a drive call's return reports the green PR: \`no-mistakes axi status\` shows progress but never reports \`checks-passed\` while the ci step is still monitoring the PR for merge, so never wait on a status poll for the next gate or outcome.
 "
     pr_reattach_clause="; once checks are green it returns \`checks-passed\` immediately, and"
@@ -338,10 +349,48 @@ There is no pull request, no \`gh-axi\` call, and no forge CI result to report: 
 EOF
 }
 
-fm_dod_block() {  # <mode> <task-id> [branch] [<forge>]
-  local mode=$1 id=$2 forge=${4:-none}
+# Prints `absent` when a no-mistakes ship on forge none targets a clone that
+# provably has no CI to wait on, and `present` in every other case, including each
+# doubt: another mode or forge, an unreadable clone, an unknown host. bin/fm-ci-detect.sh
+# owns the evidence; this is the one place that turns its verdict into the
+# <ci> argument fm_dod_block takes, shared by bin/fm-brief.sh and bin/fm-promote.sh.
+fm_dod_ci_state() {  # <mode> <forge> <project-dir>
+  local mode=$1 forge=$2 dir=${3:-} verdict
+  local detect
+  detect="$(d=${BASH_SOURCE[0]%/*}; [ "$d" != "${BASH_SOURCE[0]}" ] || d=.; cd "${d:-/}" && pwd)/fm-ci-detect.sh"
+  if [ "$mode" = no-mistakes ] && [ "$forge" = none ] && [ -n "$dir" ] && [ -d "$dir" ] \
+    && verdict=$("$detect" "$dir" 2>/dev/null) && [ "${verdict%% *}" = ci=absent ]; then
+    printf 'absent\n'
+  else
+    printf 'present\n'
+  fi
+}
+
+fm_dod_block() {  # <mode> <task-id> [branch] [<forge>] [<ci>]
+  local mode=$1 id=$2 forge=${4:-none} ci=${5:-present}
   local branch=${3:-fm/$id}
+  local ready_after ready_report ready_label skip_block=
   fm_forge_valid_for_mode "$forge" "$mode" fm_dod_block || return 1
+  case "$ci" in
+    present|absent) ;;
+    *)
+      echo "error: fm_dod_block: unknown ci state '$ci' (expected present or absent)" >&2
+      return 1 ;;
+  esac
+  ready_after="After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge)"
+  ready_report="checks green"
+  ready_label="CI-ready"
+  if [ "$mode:$forge:$ci" = no-mistakes:none:absent ]; then
+    ready_after="After /no-mistakes reports its outcome with the PR open"
+    ready_report="checks green (no CI configured)"
+    ready_label="no-CI ready"
+    IFS= read -r -d '' skip_block <<EOF || true
+This project's default branch carries no CI configuration, so the pipeline's ci step would poll for checks that can never appear.
+Pass \`--skip ci\` on every \`no-mistakes axi run\` for this task, and skip nothing else: \`push\` and \`pr\` still run, because the branch must be pushed and the PR or MR opened, and skipping ci is a supported outcome, not a degraded one.
+The run then ends \`passed-with-skips\` or \`passed\` instead of monitoring the PR, and there is no CI result to wait for.
+
+EOF
+  fi
   case "$mode:$forge" in
     direct-PR:gerrit)
       cat <<EOF
@@ -430,13 +479,13 @@ Firstmate will then instruct you to run /no-mistakes to validate and ship a PR.
 That first \`done:\` is the handoff that starts the pipeline, which owns the push; it is not a request to push from this copy.
 
 EOF
-      fm_nm_driving_block "$forge"
+      fm_nm_driving_block "$forge" "$ci"
       cat <<EOF
 
-After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), read the PR back from the forge and confirm it is not a draft (\`gh-axi pr view <number>\` must print \`draft: no\`, where <number> is the PR number from your PR URL); if it is a draft, mark it ready with \`gh-axi pr ready <number>\`.
+${skip_block}$ready_after, read the PR back from the forge and confirm it is not a draft (\`gh-axi pr view <number>\` must print \`draft: no\`, where <number> is the PR number from your PR URL); if it is a draft, mark it ready with \`gh-axi pr ready <number>\`.
 A draft cannot be merged, so a done report on one leaves the merge unasked.
-Then append \`done [at=<epoch>]: PR {url} checks green\` and stop. You are finished.
-That CI-ready \`done:\` is accepted only when this copy's HEAD - your latest commit - is one the /no-mistakes run pushed, so commit nothing after the run; the check tests that commit, not merely that a branch moved.
+Then append \`done [at=<epoch>]: PR {url} $ready_report\` and stop. You are finished.
+That $ready_label \`done:\` is accepted only when this copy's HEAD - your latest commit - is one the /no-mistakes run pushed, so commit nothing after the run; the check tests that commit, not merely that a branch moved.
 If you deliberately keep the PR a draft, append \`paused [at=<epoch>]: {why the draft is held}\` instead of done.
 EOF
       ;;

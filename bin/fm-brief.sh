@@ -72,6 +72,13 @@
 # membership pinned when its watch is armed, because the merge watch follows one
 # change.
 # It defaults to squash on gerrit and is refused without it.
+# For a no-mistakes ship on forge none, the clone at projects/<repo-name> is read
+# (bin/fm-ci-detect.sh, local git data only) and, when its default branch provably
+# carries no CI configuration on a known GitHub or GitLab host, the generated
+# contract tells the worker to pass `--skip ci` on every pipeline run and report
+# `done: PR <url> checks green (no CI configured)` once the PR is open, instead
+# of waiting for checks that can never register. An unreadable clone, an unknown
+# host, or any CI file keeps the ordinary contract; bin/fm-dod-lib.sh owns both.
 # The generated ship brief records the chosen mode as a fixed machine-readable
 # "Delivery contract: mode=<mode>" line, followed by " forge=gerrit shape=squash"
 # on that forge. bin/fm-spawn.sh reads that line and refuses to launch a ship task
@@ -610,7 +617,10 @@ case "$MODE" in
     ;;
 esac
 RULE1=$(fm_ship_rule_one "$MODE" "$ID" "$BRANCH" "$FORGE") || exit 1
-DOD=$(fm_dod_block "$MODE" "$ID" "$BRANCH" "$FORGE") || exit 1
+# A no-mistakes ship on a clone whose default branch provably has no CI is told
+# to skip the pipeline's ci step; every doubt keeps the ordinary contract.
+CI_STATE=$(fm_dod_ci_state "$MODE" "$FORGE" "${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}/$REPO")
+DOD=$(fm_dod_block "$MODE" "$ID" "$BRANCH" "$FORGE" "$CI_STATE") || exit 1
 
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.

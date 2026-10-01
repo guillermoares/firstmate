@@ -1612,6 +1612,56 @@ EOF
   pass "fm-project-mode: --branch-prefix resolves order-independently and defaults to the legacy fm/ prefix"
 }
 
+# A promoted scout receives the same no-CI instruction an ordinary no-mistakes
+# ship brief does, read from the clone its task record names; a clone that
+# carries CI, or a record that names no project, keeps the ordinary contract.
+test_promotion_skips_ci_only_when_the_project_has_none() {
+  local home clone id out ships
+  home="$TMP_ROOT/promote-ci/home"
+  mkdir -p "$home/state"
+  clone="$TMP_ROOT/promote-ci/clone-noci"
+  git init -q -b main "$clone"
+  printf 'code\n' > "$clone/README.md"
+  git -C "$clone" add -A
+  git -C "$clone" -c user.name=fmtest -c user.email=fmtest@example.invalid commit -q -m init
+  git -C "$clone" remote add origin git@gitlab.com:group/clone-noci.git
+  git -C "$clone" update-ref refs/remotes/origin/main HEAD
+  git -C "$clone" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+
+  id=promote-ci-absent
+  printf 'window=fm-%s\nkind=scout\nworktree=/tmp/wt\nproject=%s\n' "$id" "$clone" > "$home/state/$id.meta"
+  FM_HOME="$home" "$BRIEF" "$id" clone-noci --scout >/dev/null 2>&1 || fail "scout brief should scaffold"
+  fill_brief_subsections "$home/data/$id/brief.md" "Ship the change." "Keep it small."
+  FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" "$PROMOTE" "$id" --mode no-mistakes --yolo off >/dev/null 2>&1 \
+    || fail "promotion of a no-CI project should succeed"
+  ships="$home/data/$id/ship-instructions.md"
+  # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+  assert_grep 'Pass `--skip ci` on every `no-mistakes axi run`' "$ships" "promotion did not skip ci for a project with no CI"
+
+  printf 'ci\n' > "$clone/.gitlab-ci.yml"
+  git -C "$clone" add -A
+  git -C "$clone" -c user.name=fmtest -c user.email=fmtest@example.invalid commit -q -m ci
+  git -C "$clone" update-ref refs/remotes/origin/main HEAD
+  id=promote-ci-present
+  printf 'window=fm-%s\nkind=scout\nworktree=/tmp/wt\nproject=%s\n' "$id" "$clone" > "$home/state/$id.meta"
+  FM_HOME="$home" "$BRIEF" "$id" clone-noci --scout >/dev/null 2>&1 || fail "scout brief should scaffold"
+  fill_brief_subsections "$home/data/$id/brief.md" "Ship the change." "Keep it small."
+  FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" "$PROMOTE" "$id" --mode no-mistakes --yolo off >/dev/null 2>&1 \
+    || fail "promotion of a project with CI should succeed"
+  assert_no_grep '--skip ci' "$home/data/$id/ship-instructions.md" "promotion skipped ci for a project that has CI"
+
+  id=promote-ci-noproject
+  printf 'window=fm-%s\nkind=scout\nworktree=/tmp/wt\n' "$id" > "$home/state/$id.meta"
+  FM_HOME="$home" "$BRIEF" "$id" clone-noci --scout >/dev/null 2>&1 || fail "scout brief should scaffold"
+  fill_brief_subsections "$home/data/$id/brief.md" "Ship the change." "Keep it small."
+  FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" "$PROMOTE" "$id" --mode no-mistakes --yolo off >/dev/null 2>&1 \
+    || fail "promotion with no recorded project should succeed"
+  assert_no_grep '--skip ci' "$home/data/$id/ship-instructions.md" "promotion skipped ci with no project to read"
+  out=$(grep -c 'checks green' "$home/data/$id/ship-instructions.md")
+  [ "$out" -ge 1 ] || fail "promotion without a project lost the ordinary ready report"
+  pass "fm-promote.sh: promotion skips ci only for a project whose default branch has none"
+}
+
 test_ship_spawn_requires_a_valid_delivery_contract
 test_scout_and_secondmate_refuse_delivery_flags
 test_spawn_refuses_a_brief_mode_mismatch
@@ -1637,4 +1687,5 @@ test_spawn_refuses_a_registry_forge_it_cannot_read
 test_promotion_carries_the_forge_binding
 test_spawn_and_promote_require_filled_task_subsections
 test_project_mode_resolves_branch_prefix
+test_promotion_skips_ci_only_when_the_project_has_none
 echo "# all fm-task-delivery tests passed"

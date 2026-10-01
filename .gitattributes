@@ -1,2 +1,5 @@
 # Bash parses shell scripts with LF line endings on every supported platform.
 *.sh text eol=lf
+
+# All other text files also keep LF (a CRLF checkout breaks jq and similar tools).
+* text=auto eol=lf
