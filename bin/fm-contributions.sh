@@ -14,7 +14,20 @@
 # Every URL explicitly linked by a structured backlog row or a task's pr= is
 # owned. Previously observed URLs remain in data/<task>/contributions.json after
 # endpoint teardown. Repository-wide PR discovery never establishes ownership.
-# GitHub PRs and issues are supported; other forges remain visibly unmeasured.
+# GitHub PRs and issues and GitLab merge requests are supported; other forges
+# remain visibly unmeasured. A GitLab merge request is read through glab on the
+# URL's own host (self-hosted instances work wherever glab is authenticated).
+# Its observation has the GitHub PR shape: head is the merge request sha, state
+# is opened/locked -> open, merged or closed, and mergeable folds
+# detailed_merge_status (conflict, need_rebase or has_conflicts -> conflicting;
+# unchecked, checking and every other blocker -> unknown, with the raw status
+# kept in merge_status; GitLab often reports unchecked until it recomputes).
+# ci_must_pass, ci_still_running, not_approved and requested_changes leave
+# mergeable to the checks and review_decision. Checks are the head pipeline
+# (a lane named pipeline) plus its jobs, read only when the pipeline ran at the
+# merge request head; an allowed-failure job never blocks. Events are non-system
+# notes from a project member at Developer access or above other than the author;
+# approvals are not read as reviews because GitLab binds them to no commit.
 #
 # This script owns fm-contributions.v1: one atomic file per durable task with
 # task and records[]. Each record contains url, kind, checked_at, error,
@@ -38,7 +51,8 @@
 # a direct child) with a three-second margin. Every read is capped at five
 # seconds, and a read killed at that bound or at the deadline is budget
 # refusal, never a forge failure. A pull observation has three
-# dependent waves: core, six independent reads, then the closing head read;
+# dependent waves: core, up to six independent reads (three for GitLab), then the
+# closing head read;
 # an issue has two waves. Before starting a URL, poll reserves the smaller of
 # the effective budget and 15 seconds for those waves. URLs needing forge
 # reads are sorted by URL and rotated by the current five-minute epoch bucket
@@ -200,14 +214,18 @@ write_record() { # task record-json-file
   mv -f -- "$staged" "$file"
 }
 
-forge() {
-  local remaining rc=0 forge_err=${FORGE_ERR:-$TMP/forge.err}
+forge() { forge_run gh "$@"; }
+glab_forge() { forge_run glab "$@"; }
+
+forge_run() { # forge CLI, then its arguments
+  local bin=$1 remaining rc=0 forge_err=${FORGE_ERR:-$TMP/forge.err}
+  shift
   remaining=$((DEADLINE - $(date +%s)))
   # The budget, not the forge, refused this read.
   [ "$remaining" -gt 0 ] || { BUDGET_EXHAUSTED=1; : > "$TMP/budget-exhausted"; return 1; }
   [ "$remaining" -le 5 ] || remaining=5
   fm_run_timed "$remaining" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
-    gh "$@" 2> "$forge_err" || rc=$?
+    GLAB_CHECK_UPDATE=false NO_PROMPT=1 "$bin" "$@" 2> "$forge_err" || rc=$?
   # A kill at the read bound or the deadline is budget refusal too; only the
   # forge's own nonzero exit is unavailable evidence.
   if [ "$rc" -eq 124 ]; then
@@ -230,9 +248,96 @@ wait_forges() { # background forge pids from one independent read wave
   return "$rc"
 }
 
-observe() { # canonical GitHub URL -> normalized JSON
+# One paginated glab read as a slurped array of pages, the shape gh --slurp gives.
+glab_pages() { # output endpoint
+  local out=$1
+  shift
+  glab_forge api "$@" --paginate --hostname "$MR_HOST" > "$out.raw" && jq -s . "$out.raw" > "$out"
+}
+
+observe_gitlab() { # canonical GitLab merge request URL -> normalized JSON
+  local url=$1 project projects head after file
+  local -a pids=()
+  fm_pr_url_parse "$url" && [ "$FM_PR_PROVIDER" = gitlab ] || return 1
+  MR_HOST=$FM_PR_HOST
+  projects="projects/${FM_PR_PATH//\//%2F}"
+  project="$projects/merge_requests/$FM_PR_NUMBER"
+  command -v glab >/dev/null 2>&1 || { printf 'glab is required to observe a GitLab merge request\n' > "$TMP/forge.err"; : > "$TMP/forge-unavailable"; return 1; }
+  rm -f -- "$TMP/budget-exhausted" "$TMP/forge-unavailable"
+  BUDGET_EXHAUSTED=0
+  glab_forge api "$project" --hostname "$MR_HOST" > "$TMP/core.json" || return 1
+  jq -e '(.state | IN("opened","closed","merged","locked")) and (.author.username | type == "string")' "$TMP/core.json" >/dev/null || return 1
+  head=$(jq -er '.sha | select(test("^[a-fA-F0-9]{40}$"))' "$TMP/core.json") || return 1
+  # A pipeline that did not run at the merge request head says nothing about it.
+  if jq -e --arg head "$head" '.head_pipeline.sha == $head' "$TMP/core.json" >/dev/null; then
+    local pipeline_id
+    pipeline_id=$(jq -er '.head_pipeline.id | tostring' "$TMP/core.json") || return 1
+    FORGE_ERR="$TMP/jobs.err" glab_pages "$TMP/jobs.json" "$projects/pipelines/$pipeline_id/jobs?per_page=100" &
+    pids+=("$!")
+  else
+    printf '[[]]\n' > "$TMP/jobs.json"
+  fi
+  FORGE_ERR="$TMP/notes.err" glab_pages "$TMP/notes.json" "$project/notes?per_page=100&sort=asc" &
+  pids+=("$!")
+  # GitLab notes carry no author association; a project member at Developer or
+  # above stands in for GitHub's owner, member or collaborator.
+  FORGE_ERR="$TMP/members.err" glab_pages "$TMP/members.json" "$projects/members/all?per_page=100" &
+  pids+=("$!")
+  wait_forges "${pids[@]}" || return 1
+  for file in notes members jobs; do
+    jq -e 'type == "array" and all(.[]; type == "array")' "$TMP/$file.json" >/dev/null || return 1
+  done
+  glab_forge api "$project" --hostname "$MR_HOST" > "$TMP/after.json" || return 1
+  after=$(jq -er '.sha' "$TMP/after.json") || return 1
+  [ "$head" = "$after" ] || { printf 'head changed during observation\n' > "$TMP/forge.err"; return 1; }
+  jq -n --arg url "$url" --slurpfile core "$TMP/core.json" --slurpfile notes "$TMP/notes.json" \
+    --slurpfile members "$TMP/members.json" --slurpfile jobs "$TMP/jobs.json" '
+    def check_state($status; $allow):
+      if $status | IN("success","success_with_warnings") then ["completed","success"]
+      elif $status == "failed" then (if $allow then ["completed","neutral"] else ["completed","failure"] end)
+      elif $status | IN("canceled","canceling") then ["completed","cancelled"]
+      elif $status == "skipped" then ["completed","skipped"]
+      elif $status == "manual" then (if $allow then ["completed","skipped"] else ["queued",null] end)
+      elif $status == "running" then ["in_progress",null]
+      else ["queued",null] end;
+    $core[0] as $c
+    | ([$members[0] | add // [] | .[] | select(.access_level >= 30) | .username]) as $maintainers
+    | ($c.detailed_merge_status // "unchecked") as $detail
+    | {head:$c.sha,state:(if $c.state == "locked" then "open" elif $c.state == "opened" then "open" else $c.state end),
+        draft:($c.draft // false),
+        mergeable:(if $c.has_conflicts == true or ($detail | IN("conflict","need_rebase")) then "conflicting"
+          elif $detail | IN("mergeable","ci_must_pass","ci_still_running","not_approved","requested_changes") then "mergeable"
+          else "unknown" end),
+        merge_status:$detail,
+        can_merge:($c.user.can_merge // false),
+        review_decision:(if $detail == "not_approved" then "REVIEW_REQUIRED" elif $detail == "requested_changes" then "CHANGES_REQUESTED" else "" end),
+        reviews:[],
+        checks:((if $c.head_pipeline.sha == $c.sha then
+            [$c.head_pipeline | check_state(.status; false) as $s
+              | {name:"pipeline",id:.id,status:$s[0],conclusion:$s[1],started_at:(.started_at // .created_at)}] else [] end)
+          + [$jobs[0] | add // [] | .[] | check_state(.status; (.allow_failure // false)) as $s
+              | {name,id,status:$s[0],conclusion:$s[1],started_at:(.started_at // .created_at)}]),
+        events:([$notes[0] | add // [] | .[]
+            | select((.system | not) and .author.username != $c.author.username and (.author.username | IN($maintainers[])))
+            | {token:("note:" + (.id | tostring) + ":" + (.updated_at // "")),
+               type:(if .type == "DiffNote" then "review-comment" else "comment" end),
+               source:($url + "#note_" + (.id | tostring)),head:(.position.head_sha // null),
+               author:.author.username,body:(.body // "" | .[:500])}])}' > "$TMP/observation.json" || return 1
+}
+
+validate_observation() { # canonical-url pr|issue
+  jq_lib -ne --arg url "$1" --arg kind "$2" --slurpfile observed "$TMP/observation.json" '
+    {schema:"fm-contributions.v1",task:"observation",records:[{url:$url,
+      kind:$kind,pending:[],seen:[],observation:$observed[0]}]}
+    | valid_record' >/dev/null
+}
+
+observe() { # canonical GitHub URL or GitLab merge request URL -> normalized JSON
   local url=$1 part number kind endpoint head after label
-  case "$url" in https://github.com/*) ;; *) return 1 ;; esac
+  case "$url" in
+    https://github.com/*) ;;
+    *) observe_gitlab "$url" || return 1; validate_observation "$url" pr; return ;;
+  esac
   part=${url#https://github.com/}; number=${part##*/}; part=${part%/*}; kind=${part##*/}; part=${part%/*}
   case "$kind" in pull) endpoint="repos/$part/pulls/$number" ;; issues) endpoint="repos/$part/issues/$number" ;; *) return 1 ;; esac
   rm -f -- "$TMP/budget-exhausted" "$TMP/forge-unavailable"
@@ -295,10 +400,7 @@ observe() { # canonical GitHub URL -> normalized JSON
           + [$timeline[0][] | .[] | select(.event == "labeled" and (.label.name | ascii_downcase) == ($label | ascii_downcase))
              | {token:("ready-for-pr:" + (.id | tostring)),type:"ready-for-pr",source:$c.html_url,head:null,body:"filed issue reached ready-for-pr"}])}' > "$TMP/observation.json" || return 1
   fi
-  jq_lib -ne --arg url "$url" --arg kind "$kind" --slurpfile observed "$TMP/observation.json" '
-    {schema:"fm-contributions.v1",task:"observation",records:[{url:$url,
-      kind:(if $kind == "pull" then "pr" else "issue" end),pending:[],seen:[],observation:$observed[0]}]}
-    | valid_record' >/dev/null
+  validate_observation "$url" "$(if [ "$kind" = pull ]; then printf pr; else printf issue; fi)"
 }
 
 publish_pending() { # task canonical-url record-file
