@@ -2,6 +2,13 @@
 def canonical_url:
   type == "string" and (test("^https://github.com/[A-Za-z0-9-]+/[A-Za-z0-9._-]+/(pull|issues)/[1-9][0-9]*$")
     or test("^https://[A-Za-z0-9.-]+/[A-Za-z0-9._/-]+/-/merge_requests/[1-9][0-9]*$"));
+# Measured forges: GitHub pulls and issues, and GitLab merge requests on any
+# lowercase DNS host other than github.com. A canonical URL outside both stays
+# visibly unmeasured.
+def measured_url:
+  type == "string" and (test("^https://github\\.com/[^/]+/[^/]+/(pull|issues)/[1-9][0-9]*$")
+    or (startswith("https://github.com/") | not)
+      and test("^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?/[^/]+(/[^/]+)*/-/merge_requests/[1-9][0-9]*$"));
 def sha: type == "string" and test("^[a-fA-F0-9]{40}$");
 def valid_record:
   try (.schema == "fm-contributions.v1" and (.task | type == "string")
@@ -22,6 +29,7 @@ def valid_record:
         and (.status | type == "string") and (.conclusion == null or (.conclusion | type == "string")))
       and (if $kind == "pr" then (.head | sha) and (.draft | type == "boolean")
         and (.mergeable | IN("mergeable","conflicting","unknown")) and (.can_merge | type == "boolean")
+        and (.merge_status == null or (.merge_status | type == "string"))
         and (.review_decision | IN("","APPROVED","CHANGES_REQUESTED","REVIEW_REQUIRED"))
         else (.ready | type == "boolean") end))))) catch false;
 def known($input; $saved):
@@ -52,7 +60,7 @@ def projected($input; $saved; $now; $max_age):
     | (($final or ($checked != null and ($now - $checked) >= 0 and ($now - $checked) <= $max_age))
        and (if $record.kind == "pr" then $observed_head != null
             else $record.error == null and $record.observation != null end)
-       and ($k.url | startswith("https://github.com/"))) as $fresh
+       and ($k.url | measured_url)) as $fresh
     | (($o.checks // []) | latest_checks) as $checks
     | [$checks[] | select(.status == "completed" and (.conclusion == null or .conclusion == ""))] as $no_verdict
     | [$checks[] | select(.status != "completed")] as $pending
@@ -64,7 +72,7 @@ def projected($input; $saved; $now; $max_age):
     | ([$o.reviews[]? | select(.state != "COMMENTED")] | group_by(.user.login)
        | map(sort_by([.submitted_at,.id]) | last)
        | map(. + {freshness:(if $observed_head != null and .commit_id != $observed_head then "STALE" elif $fresh then "current" else "unverified" end)})) as $reviews
-    | (if ($k.url | startswith("https://github.com/") | not) then
+    | (if ($k.url | measured_url | not) then
          {actor:"unmeasured",reason:"unsupported forge; coverage is unmeasured"}
        elif $o.state == "merged" or $o.state == "closed" then
          if $fresh then {actor:"nobody",reason:("forge reports " + $o.state)}
@@ -77,7 +85,7 @@ def projected($input; $saved; $now; $max_age):
          if $o.ready then {actor:"fleet",reason:"filed issue is ready-for-pr"}
          else {actor:"maintainer",reason:"awaiting issue triage"} end
        elif $o.draft then {actor:"fleet",reason:"draft delivery"}
-       elif $o.mergeable != "mergeable" then {actor:"fleet",reason:("mergeability " + ($o.mergeable // "unknown"))}
+       elif $o.mergeable != "mergeable" then {actor:"fleet",reason:("mergeability " + ($o.mergeable // "unknown") + (if $o.merge_status then " (" + $o.merge_status + ")" else "" end))}
        elif ($failed | length) > 0 then {actor:"fleet",reason:"checks failed"}
        elif ($no_verdict | length) > 0 or (($o.absent_checks // []) | length) > 0 then
          {actor:"fleet",reason:"check lane has no verdict"}
