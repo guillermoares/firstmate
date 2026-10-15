@@ -348,9 +348,22 @@ case "${1:-} ${2:-}" in
     [ ! -e "$case_dir/glab-view-fails" ] || exit 1
     if [ -e "$case_dir/glab-merge-called" ] && [ ! -e "$case_dir/glab-stays-open" ]; then
       cat "$case_dir/mr-post.json"
+    elif [ -e "$case_dir/glab-rebased" ]; then
+      # After a rebase each read serves the next mr-rebased-N.json, repeating
+      # the last one, so a case scripts how the new pipeline progresses.
+      n=$(( $(cat "$case_dir/glab-rebased-reads" 2>/dev/null || echo 0) + 1 ))
+      echo "$n" > "$case_dir/glab-rebased-reads"
+      last=$(ls "$case_dir"/mr-rebased-*.json | wc -l)
+      [ "$n" -le "$last" ] || n=$last
+      cat "$case_dir/mr-rebased-$n.json"
     else
       cat "$FM_TEST_GLAB_JSON"
     fi
+    exit 0
+    ;;
+  "mr rebase")
+    [ ! -e "$case_dir/glab-rebase-fails" ] || { echo "error: rebase failed: conflicts" >&2 ; exit 1 ; }
+    : > "$case_dir/glab-rebased"
     exit 0
     ;;
   "mr merge")
@@ -373,7 +386,7 @@ write_mr_json() {
   local file=$1 kv key value
   local state=opened detail=mergeable conflicts=false discussions=true
   local head=$MR_HEAD pipeline_sha=$MR_HEAD pipeline_status=success pipeline=present
-  local merge_when_pipeline_succeeds=false merge_after=null
+  local merge_when_pipeline_succeeds=false merge_after=null draft=false
   shift
   for kv in "$@"; do
     key=${kv%%=*}
@@ -389,6 +402,7 @@ write_mr_json() {
       pipeline) pipeline=$value ;;
       merge_when_pipeline_succeeds) merge_when_pipeline_succeeds=$value ;;
       merge_after) merge_after=$value ;;
+      draft) draft=$value ;;
       *) fail "write_mr_json: unknown field '$key'" ;;
     esac
   done
@@ -399,8 +413,8 @@ write_mr_json() {
     "$state" "$detail" "$conflicts" > "$file"
   printf '"blocking_discussions_resolved":%s,"sha":"%s","head_pipeline":%s,' \
     "$discussions" "$head" "$pipeline" >> "$file"
-  printf '"merge_when_pipeline_succeeds":%s,"merge_after":%s}\n' \
-    "$merge_when_pipeline_succeeds" "$merge_after" >> "$file"
+  printf '"merge_when_pipeline_succeeds":%s,"merge_after":%s,"draft":%s}\n' \
+    "$merge_when_pipeline_succeeds" "$merge_after" "$draft" >> "$file"
 }
 
 # make_gitlab_case <name> [<field>=<value> ...]: a case dir with both forge
@@ -1850,7 +1864,7 @@ test_gitlab_each_condition_refuses_independently() {
   local case_dir rc name expected spec
   set -- \
     "state|state=closed|state is \"closed\", not open" \
-    "detail|detail=need_rebase|detailed_merge_status is \"need_rebase\", not mergeable" \
+    "detail|detail=blocked_status|detailed_merge_status is \"blocked_status\", not mergeable" \
     "conflicts|conflicts=true|has_conflicts is \"true\", not false" \
     "discussions|discussions=false|blocking_discussions_resolved is \"false\", not true" \
     "pipeline-status|pipeline_status=failed|the head pipeline status is \"failed\", not success" \
@@ -1881,6 +1895,157 @@ test_gitlab_each_condition_refuses_independently() {
       "gitlab-refuse-$name: a refusal should still leave the merge poll armed"
   done
   pass "fm-pr-merge refuses on each GitLab pre-merge condition independently"
+}
+
+MR_REBASED_HEAD=dddddddddddddddddddddddddddddddddddddddd
+
+# make_gitlab_rebase_case <name> <post-rebase payload spec>...: a fast-forward-only
+# merge request that is green but behind its target. Each later argument is one
+# space-separated write_mr_json field list for the next post-rebase read.
+make_gitlab_rebase_case() {
+  local name=$1 case_dir n=0 spec; shift
+  case_dir=$(make_gitlab_case "$name" detail=need_rebase)
+  for spec in "$@"; do
+    n=$((n + 1))
+    # shellcheck disable=SC2086
+    write_mr_json "$case_dir/mr-rebased-$n.json" $spec
+  done
+  printf '%s\n' "$case_dir"
+}
+
+glab_rebase_line() {
+  grep -F ' mr rebase ' "$1" || true
+}
+
+test_gitlab_behind_mr_is_rebased_then_merged() {
+  local case_dir rc line_numbers rebase_n merge_n
+  case_dir=$(make_gitlab_rebase_case gitlab-rebase-merge \
+    "head=$MR_REBASED_HEAD pipeline_sha=$MR_STALE_HEAD" \
+    "head=$MR_REBASED_HEAD pipeline_sha=$MR_REBASED_HEAD pipeline_status=running detail=ci_still_running" \
+    "head=$MR_REBASED_HEAD pipeline_sha=$MR_REBASED_HEAD")
+
+  set +e
+  FM_PR_GITLAB_REBASE_WAIT=30 FM_PR_GITLAB_REBASE_POLL=0 \
+    run_pr_merge "$case_dir" task-x1 "$MR_URL" \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "gitlab-rebase-merge: a green MR that is only behind should be rebased and merged"
+  [ "$(glab_rebase_line "$case_dir/glab.log")" = "GITLAB_HOST=$MR_HOST mr rebase 7 -R $MR_PROJECT_URL" ] \
+    || fail "gitlab-rebase-merge: unexpected rebase invocation: '$(glab_rebase_line "$case_dir/glab.log")'"
+  assert_no_grep -- '--skip-ci' "$case_dir/glab.log" \
+    "gitlab-rebase-merge: the rebase skipped CI, so no pipeline would verify the new head"
+  [ "$(glab_merge_line "$case_dir/glab.log")" = "GITLAB_HOST=$MR_HOST mr merge 7 -R $MR_PROJECT_URL --sha $MR_REBASED_HEAD --yes" ] \
+    || fail "gitlab-rebase-merge: the merge was not bound to the rebased head: '$(glab_merge_line "$case_dir/glab.log")'"
+  rebase_n=$(grep -n ' mr rebase ' "$case_dir/glab.log" | head -1 | cut -d: -f1)
+  merge_n=$(grep -n ' mr merge ' "$case_dir/glab.log" | head -1 | cut -d: -f1)
+  line_numbers="$rebase_n<$merge_n"
+  [ "$rebase_n" -lt "$merge_n" ] || fail "gitlab-rebase-merge: merge ran before the rebase ($line_numbers)"
+  assert_grep "successful pipeline at head $MR_REBASED_HEAD" "$case_dir/stderr" \
+    "gitlab-rebase-merge: the rebased head was not the one verified"
+  pass "fm-pr-merge rebases a green GitLab MR that is behind, waits for the new pipeline, and merges the new head"
+}
+
+test_gitlab_current_mr_is_not_rebased() {
+  local case_dir rc
+  case_dir=$(make_gitlab_case gitlab-no-rebase)
+
+  set +e
+  run_pr_merge "$case_dir" task-x1 "$MR_URL" \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "gitlab-no-rebase: an up-to-date MR should merge"
+  [ -z "$(glab_rebase_line "$case_dir/glab.log")" ] \
+    || fail "gitlab-no-rebase: an MR that was not behind was rebased"
+  pass "fm-pr-merge does not rebase a GitLab MR that is not behind"
+}
+
+test_gitlab_rebase_conflict_sends_back() {
+  local case_dir rc
+  case_dir=$(make_gitlab_rebase_case gitlab-rebase-conflict "head=$MR_REBASED_HEAD pipeline_sha=$MR_REBASED_HEAD")
+  : > "$case_dir/glab-rebase-fails"
+
+  set +e
+  FM_PR_GITLAB_REBASE_WAIT=5 FM_PR_GITLAB_REBASE_POLL=0 \
+    run_pr_merge "$case_dir" task-x1 "$MR_URL" \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "gitlab-rebase-conflict: a rebase conflict should stop the merge"
+  assert_grep 'Send it back to its worker to resolve the conflict, then review it again' "$case_dir/stderr" \
+    "gitlab-rebase-conflict: the refusal did not send the MR back to its worker"
+  [ -z "$(glab_merge_line "$case_dir/glab.log")" ] || fail "gitlab-rebase-conflict: a merge was attempted"
+  pass "fm-pr-merge stops and sends a GitLab MR back to its worker when the rebase conflicts"
+}
+
+test_gitlab_rebase_red_pipeline_sends_back() {
+  local case_dir rc
+  case_dir=$(make_gitlab_rebase_case gitlab-rebase-red \
+    "head=$MR_REBASED_HEAD pipeline_sha=$MR_REBASED_HEAD pipeline_status=failed detail=ci_must_pass")
+
+  set +e
+  FM_PR_GITLAB_REBASE_WAIT=5 FM_PR_GITLAB_REBASE_POLL=0 \
+    run_pr_merge "$case_dir" task-x1 "$MR_URL" \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "gitlab-rebase-red: a red pipeline at the rebased head should stop the merge"
+  assert_grep 'ended "failed"; nothing was merged. Send it back to its worker to fix and rebase' "$case_dir/stderr" \
+    "gitlab-rebase-red: the refusal did not send the MR back to its worker"
+  [ -z "$(glab_merge_line "$case_dir/glab.log")" ] || fail "gitlab-rebase-red: a merge was attempted"
+  pass "fm-pr-merge stops and sends a GitLab MR back to its worker when the rebased pipeline fails"
+}
+
+test_gitlab_rebase_pipeline_timeout_is_a_retry() {
+  local case_dir rc
+  case_dir=$(make_gitlab_rebase_case gitlab-rebase-timeout \
+    "head=$MR_REBASED_HEAD pipeline_sha=$MR_REBASED_HEAD pipeline_status=running detail=ci_still_running")
+
+  set +e
+  FM_PR_GITLAB_REBASE_WAIT=1 FM_PR_GITLAB_REBASE_POLL=0 \
+    run_pr_merge "$case_dir" task-x1 "$MR_URL" \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "gitlab-rebase-timeout: a pipeline still running at the deadline should stop the merge"
+  assert_grep 'The rebase stands, so retry the merge once the pipeline finishes' "$case_dir/stderr" \
+    "gitlab-rebase-timeout: the refusal did not present this as a retry"
+  [ -z "$(glab_merge_line "$case_dir/glab.log")" ] || fail "gitlab-rebase-timeout: a merge was attempted"
+  pass "fm-pr-merge reports a still-running rebased pipeline as a retry, not a send-back"
+}
+
+test_gitlab_behind_mr_not_green_is_not_rebased() {
+  local case_dir rc spec name
+  for spec in \
+    "red-pipeline|pipeline_status=failed" \
+    "stale-pipeline|pipeline_sha=$MR_STALE_HEAD" \
+    "draft|draft=true" \
+    "conflicts|conflicts=true" \
+    "discussions|discussions=false"
+  do
+    name=${spec%%|*}
+    case_dir=$(make_gitlab_case "gitlab-no-rebase-$name" detail=need_rebase "${spec#*|}")
+
+    set +e
+    run_pr_merge "$case_dir" task-x1 "$MR_URL" \
+      > "$case_dir/stdout" 2> "$case_dir/stderr"
+    rc=$?
+    set -e
+
+    expect_code 1 "$rc" "gitlab-no-rebase-$name: a behind MR that is not green should be refused"
+    [ -z "$(glab_rebase_line "$case_dir/glab.log")" ] \
+      || fail "gitlab-no-rebase-$name: an MR that was not green was rebased"
+    assert_grep 'send it back to its worker, which fixes it and rebases before a new review' "$case_dir/stderr" \
+      "gitlab-no-rebase-$name: the refusal did not send the MR back to its worker"
+    [ -z "$(glab_merge_line "$case_dir/glab.log")" ] || fail "gitlab-no-rebase-$name: a merge was attempted"
+  done
+  pass "fm-pr-merge rebases only a GitLab MR whose sole problem is being behind"
 }
 
 test_gitlab_reports_every_failing_condition() {
@@ -2407,6 +2572,12 @@ test_gitlab_imposes_no_merge_method
 test_gitlab_extra_args_forwarded
 test_gitlab_merge_failure_propagates
 test_gitlab_each_condition_refuses_independently
+test_gitlab_behind_mr_is_rebased_then_merged
+test_gitlab_current_mr_is_not_rebased
+test_gitlab_rebase_conflict_sends_back
+test_gitlab_rebase_red_pipeline_sends_back
+test_gitlab_rebase_pipeline_timeout_is_a_retry
+test_gitlab_behind_mr_not_green_is_not_rebased
 test_gitlab_reports_every_failing_condition
 test_gitlab_stale_recorded_head_is_reported
 test_gitlab_unreadable_state_refuses

@@ -273,3 +273,11 @@ It is optional by design, and the other consumers already treat it that way: `bi
 The merge path does not record one either, and deliberately does not depend on one.
 A rebase moves the head and leaves any recorded value stale, so a merge decided from metadata can verify a commit that no longer exists.
 Reading the head live at merge time, reporting a recorded value that disagrees, and binding the merge to what was actually verified is what closes that gap.
+
+## Rebasing a merge request that is behind
+
+A project merged fast-forward only refuses a merge request whose branch is behind its target, and reports `detailed_merge_status` as `need_rebase`.
+When that is the only thing wrong, `bin/fm-pr-merge.sh` runs `glab mr rebase <n> -R <project URL>` (checked against `glab mr rebase --help`; `--skip-ci` exists and is deliberately not passed, because the merge requires a successful pipeline at the new head), polls the merge request until its head has moved and the head pipeline at that head has succeeded, and then applies the usual checks and head-bound merge.
+A failed rebase, a failed or cancelled pipeline, and a closed merge request stop the merge with a message that sends the work back to its worker; a pipeline still running at `FM_PR_GITLAB_REBASE_WAIT` seconds stops it as a retry.
+`tests/fm-pr-merge.test.sh` covers each outcome against a `glab` stub, including that the merge is bound to the rebased head.
+None of this has been run against a live GitLab: that a conflicting rebase makes `glab mr rebase` exit non-zero, that the rebase has finished by the time it returns, and the exact `detailed_merge_status` values seen while the new pipeline is created are taken from the GitLab API documentation and the stub, not from a live instance.

@@ -1387,6 +1387,31 @@ test_no_ci_clone_skips_the_ci_step() {
   pass "fm-brief.sh: a no-CI GitLab clone skips only ci, still pushes and opens the PR, and keeps the gates"
 }
 
+test_ff_only_rebase_contract_follows_the_mode() {
+  local home brief
+  home="$TMP_ROOT/ff-rebase-home"
+  mkdir -p "$home/data"
+  make_ci_clone "$home" ffproj git@gitlab.com:group/ffproj.git .gitlab-ci.yml
+
+  brief=$(ci_brief "$home" ff-direct ffproj direct-PR)
+  assert_contains "$(dod_section "$brief")" 'the project merges fast-forward only' "direct-PR brief lost the fast-forward-only rule"
+  # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+  assert_contains "$(dod_section "$brief")" 'rebase your branch onto the current `origin/<target branch>`' \
+    "direct-PR brief did not tell the worker to rebase before reporting ready"
+  assert_contains "$(dod_section "$brief")" 'again after every review-fix round' "direct-PR brief did not repeat the rebase after review fixes"
+  assert_contains "$(dod_section "$brief")" 'needs a new review; a clean rebase needs none' "direct-PR brief did not tie a new review to a resolved conflict"
+
+  brief=$(ci_brief "$home" ff-nm ffproj no-mistakes)
+  assert_contains "$(dod_section "$brief")" "the pipeline's own rebase step puts the branch directly on the current target branch" \
+    "no-mistakes brief did not reuse the pipeline's rebase step"
+  assert_contains "$(dod_section "$brief")" 'do not hand-rebase' "no-mistakes brief let the worker duplicate the pipeline's rebase"
+
+  brief=$(ci_brief "$home" ff-local ffproj local-only)
+  assert_no_grep 'fast-forward only, ' "$brief" "local-only brief picked up the GitLab rebase rule"
+  assert_no_grep 'merges fast-forward only' "$brief" "local-only brief picked up the GitLab rebase rule"
+  pass "fm-brief.sh: the fast-forward-only rebase contract rides the PR-raising modes only"
+}
+
 test_no_ci_github_clone_skips_the_ci_step() {
   local home brief
   home="$TMP_ROOT/ci-absent-github-home"
@@ -1520,6 +1545,7 @@ test_branch_prefix_value_is_validated
 test_branch_prefix_command_is_shell_safe
 test_crewmate_scaffolds_forbid_pool_administration
 test_no_ci_clone_skips_the_ci_step
+test_ff_only_rebase_contract_follows_the_mode
 test_no_ci_github_clone_skips_the_ci_step
 test_any_ci_file_keeps_the_ordinary_contract
 test_unknown_ci_state_keeps_the_ordinary_contract
