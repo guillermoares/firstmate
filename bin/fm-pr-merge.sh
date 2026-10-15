@@ -82,7 +82,19 @@
 # a merge command that failed keeps its original error surfaced raw and first.
 # GitLab adds no method flag at all: its merge method is the project's own
 # setting, which the merge API applies, and imposing squash there would override
-# that convention rather than mirror the GitHub default.
+# that convention rather than mirror the GitHub default. Firstmate's GitLab
+# projects are set to fast-forward-only merges with squash always on.
+#
+# A fast-forward-only GitLab merge request that is green but behind its target
+# reads detailed_merge_status need_rebase. When that is the only thing wrong,
+# this script rebases it through `glab mr rebase` (never --skip-ci, so a new
+# pipeline runs), waits for the pipeline at the new head to succeed, and then
+# applies the checks below to the new head, with no new review. A rebase GitLab
+# refuses (a conflict) or a pipeline that ends red stops the merge and sends the
+# merge request back to its worker for a fix and a new review; a pipeline still
+# running at the deadline (FM_PR_GITLAB_REBASE_WAIT seconds, default 1800;
+# FM_PR_GITLAB_REBASE_POLL seconds between reads, default 15) stops it as a retry
+# later. Any other need_rebase state is left for the checks below to refuse.
 #
 # A GitLab merge is refused unless every pre-merge condition holds, each read
 # live at merge time rather than taken from recorded metadata: the merge request
@@ -550,6 +562,124 @@ FIELDS
     "$URL" "$live_head" >&2
   FM_PR_MERGE_HEAD=$live_head
   FM_PR_GITLAB_ASYNC_CONFIGURED=$async_configured
+}
+
+# One live read of the merge request for the rebase step, as GL_* variables. A
+# field that is absent or unreadable becomes an empty string, which satisfies no
+# comparison below. Returns non-zero when the merge request cannot be read.
+GL_STATE='' GL_DRAFT='' GL_DETAIL='' GL_CONFLICTS='' GL_DISCUSSIONS=''
+GL_HEAD='' GL_PIPE_SHA='' GL_PIPE_STATUS=''
+gitlab_snapshot() {
+  local json fields line
+  GL_STATE='' GL_DRAFT='' GL_DETAIL='' GL_CONFLICTS='' GL_DISCUSSIONS=''
+  GL_HEAD='' GL_PIPE_SHA='' GL_PIPE_STATUS=''
+  json=$(GITLAB_HOST="$FM_PR_HOST" glab mr view "$PR_NUMBER" -R "$PROJECT_URL" -F json 2>/dev/null) \
+    && [ -n "$json" ] || return 1
+  fields=$(printf '%s' "$json" | jq -r '
+      if type == "object" then
+        "state=" + ((.state // "") | tostring),
+        "draft=" + ((.draft // false) | tostring),
+        "detail=" + ((.detailed_merge_status // "") | tostring),
+        "conflicts=" + (.has_conflicts | tostring),
+        "discussions=" + (.blocking_discussions_resolved | tostring),
+        "head=" + ((.sha // "") | tostring),
+        "pipeline_sha=" + ((.head_pipeline.sha // "") | tostring),
+        "pipeline_status=" + ((.head_pipeline.status // "") | tostring)
+      else
+        error("merge request payload is not an object")
+      end' 2>/dev/null) || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      state=*) GL_STATE=${line#state=} ;;
+      draft=*) GL_DRAFT=${line#draft=} ;;
+      detail=*) GL_DETAIL=${line#detail=} ;;
+      conflicts=*) GL_CONFLICTS=${line#conflicts=} ;;
+      discussions=*) GL_DISCUSSIONS=${line#discussions=} ;;
+      head=*) GL_HEAD=${line#head=} ;;
+      pipeline_sha=*) GL_PIPE_SHA=${line#pipeline_sha=} ;;
+      pipeline_status=*) GL_PIPE_STATUS=${line#pipeline_status=} ;;
+    esac
+  done <<FIELDS
+$fields
+FIELDS
+}
+
+# GitLab merges fast-forward only, so a merge request that is green but behind
+# its target reads detailed_merge_status need_rebase and GitLab refuses to merge
+# it. When that is the only thing wrong - open, not a draft, no conflicts,
+# discussions resolved, and a successful pipeline at the current head - this
+# rebases the merge request server side through glab, without --skip-ci so a new
+# pipeline runs at the new head, and waits for that pipeline to succeed. The
+# merge itself is then decided by gitlab_verify_mergeable's usual live read. Any
+# other state is left alone for that read to report. A rebase that GitLab
+# refuses (a conflict) or a pipeline that does not succeed stops the merge: the
+# work goes back to its worker and is reviewed again. A pipeline still running at
+# the deadline (FM_PR_GITLAB_REBASE_WAIT seconds, default 1800, polled every
+# FM_PR_GITLAB_REBASE_POLL seconds, default 15) also stops it, but only as a
+# retry later, because nothing about the work is wrong.
+gitlab_rebase_if_behind() {
+  local old_head out wait_s poll_s deadline why=''
+  gitlab_snapshot || return 0
+  [ "$GL_DETAIL" = need_rebase ] || return 0
+  [ "$GL_STATE" = opened ] || why='it is not open'
+  [ -z "$why" ] && [ "$GL_DRAFT" = true ] && why='it is a draft'
+  [ -z "$why" ] && [ "$GL_CONFLICTS" != false ] && why='it has conflicts or its conflict state is unreadable'
+  [ -z "$why" ] && [ "$GL_DISCUSSIONS" != true ] && why='blocking discussions are unresolved'
+  [ -z "$why" ] && { [ "$GL_PIPE_STATUS" != success ] || [ "$GL_PIPE_SHA" != "$GL_HEAD" ]; } \
+    && why="its head pipeline is not a success at the current head $GL_HEAD"
+  if [ -n "$why" ]; then
+    printf 'notice: %s is behind its target but is not rebased by the merge because %s; send it back to its worker, which fixes it and rebases before a new review\n' \
+      "$URL" "$why" >&2
+    return 0
+  fi
+
+  wait_s=${FM_PR_GITLAB_REBASE_WAIT:-1800}
+  poll_s=${FM_PR_GITLAB_REBASE_POLL:-15}
+  case "$wait_s" in '' | *[!0-9]*) wait_s=1800 ;; esac
+  case "$poll_s" in '' | *[!0-9]*) poll_s=15 ;; esac
+  old_head=$GL_HEAD
+  printf 'notice: %s is green but behind its target, which GitLab merges fast-forward only; rebasing it and waiting for the pipeline at the new head\n' \
+    "$URL" >&2
+  if ! out=$(GITLAB_HOST="$FM_PR_HOST" glab mr rebase "$PR_NUMBER" -R "$PROJECT_URL" 2>&1); then
+    printf 'error: GitLab did not rebase %s, most likely because the rebase conflicts with the target; nothing was merged. Send it back to its worker to resolve the conflict, then review it again\n' \
+      "$URL" >&2
+    [ -z "$out" ] || printf 'forge output: %s\n' "$out" >&2
+    return 1
+  fi
+
+  deadline=$(( $(date +%s) + wait_s ))
+  while :; do
+    if gitlab_snapshot; then
+      if [ "$GL_STATE" != opened ]; then
+        printf 'error: %s is no longer open after the rebase (state "%s"); nothing was merged\n' "$URL" "$GL_STATE" >&2
+        return 1
+      fi
+      if [ "$GL_HEAD" != "$old_head" ] && [ "$GL_PIPE_SHA" = "$GL_HEAD" ]; then
+        case "$GL_PIPE_STATUS" in
+          success)
+            case "$GL_DETAIL" in
+              checking | unchecked | preparing | ci_still_running) ;;
+              *)
+                printf 'notice: %s rebased to head %s with a successful pipeline\n' "$URL" "$GL_HEAD" >&2
+                return 0
+                ;;
+            esac
+            ;;
+          failed | canceled | canceling | skipped)
+            printf 'error: the pipeline at the rebased head %s of %s ended "%s"; nothing was merged. Send it back to its worker to fix and rebase, then review it again\n' \
+              "$GL_HEAD" "$URL" "$GL_PIPE_STATUS" >&2
+            return 1
+            ;;
+        esac
+      fi
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      printf 'error: the rebased %s has no successful pipeline at its new head after %ss; nothing was merged. The rebase stands, so retry the merge once the pipeline finishes\n' \
+        "$URL" "$wait_s" >&2
+      return 1
+    fi
+    sleep "$poll_s"
+  done
 }
 
 # Every GitHub check that is not green in the given live pull-request JSON, one
@@ -1427,6 +1557,10 @@ case "$PROVIDER" in
     fi
     ;;
   gitlab)
+    # The captain-hold and away-authority reads above have already passed, so a
+    # rebase here mutates the merge request only under the same authority as the
+    # merge it prepares.
+    gitlab_rebase_if_behind || exit 1
     gitlab_verify_mergeable || exit 1
     # --sha binds the merge to the head this run verified, so a push that lands
     # in between is refused by GitLab instead of merged unverified. --yes only

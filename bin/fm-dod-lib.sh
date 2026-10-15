@@ -366,6 +366,36 @@ fm_dod_ci_state() {  # <mode> <forge> <project-dir>
   fi
 }
 
+# What a worker on a GitLab project owes the fast-forward-only merge, written once
+# for both PR-raising modes. GitLab merges these projects fast-forward only, so a
+# merge request must sit directly on the current target when it is handed over for
+# review. A direct-PR worker rebases itself; a no-mistakes worker already gets the
+# same from the pipeline's own rebase step, so it only learns not to duplicate it.
+# Firstmate rebases a green request that falls behind afterwards
+# (bin/fm-pr-merge.sh owns that), which is why only a conflict comes back here.
+fm_ff_rebase_block() {  # <direct-PR|no-mistakes>
+  case "$1" in
+    direct-PR)
+      cat <<'EOF'
+
+If the PR is a GitLab merge request, the project merges fast-forward only, so the branch must sit directly on the current target branch each time you hand it over for review.
+Right before you report done, and again after every review-fix round before you hand it back, run `git fetch origin`, rebase your branch onto the current `origin/<target branch>`, and push with `git push --force-with-lease`; do this as the last step, with nothing committed after it.
+Resolve any rebase conflict yourself and say so in your report, because a conflict you resolved changes the code and needs a new review; a clean rebase needs none.
+Firstmate rebases a green merge request that falls behind the target after you are done, so do not rebase it again once it is reported ready.
+EOF
+      ;;
+    no-mistakes)
+      cat <<'EOF'
+
+If the PR is a GitLab merge request, the project merges fast-forward only, and the pipeline's own rebase step puts the branch directly on the current target branch at the start of every run, including each fix round firstmate sends you back for.
+Reuse that: do not hand-rebase, and commit nothing after the run, because the ready report is accepted only for a head the run pushed.
+If the rebase hit a conflict you had to resolve, say so in your report, because that changes the code and needs a new review.
+Firstmate rebases a green merge request that falls behind the target after you are done.
+EOF
+      ;;
+  esac
+}
+
 fm_dod_block() {  # <mode> <task-id> [branch] [<forge>] [<ci>]
   local mode=$1 id=$2 forge=${4:-none} ci=${5:-present}
   local branch=${3:-fm/$id}
@@ -454,6 +484,7 @@ That \`done:\` is accepted only when this copy's HEAD - your latest commit - is 
 If you deliberately keep the PR a draft, append \`paused [at=<epoch>]: {why the draft is held}\` instead of done.
 Do NOT run /no-mistakes. The configured merge authority decides whether to merge the PR; firstmate relays the outcome.
 EOF
+      fm_ff_rebase_block direct-PR
       ;;
     local-only:*)
       cat <<EOF
@@ -488,6 +519,7 @@ Then append \`done [at=<epoch>]: PR {url} $ready_report\` and stop. You are fini
 That $ready_label \`done:\` is accepted only when this copy's HEAD - your latest commit - is one the /no-mistakes run pushed, so commit nothing after the run; the check tests that commit, not merely that a branch moved.
 If you deliberately keep the PR a draft, append \`paused [at=<epoch>]: {why the draft is held}\` instead of done.
 EOF
+      fm_ff_rebase_block no-mistakes
       ;;
     *)
       echo "error: fm_dod_block: unknown delivery mode '$mode'" >&2
